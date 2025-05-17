@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/openbao/openbao/api/v2"
 )
@@ -12,6 +13,7 @@ import (
 func TestKVRoot(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testKVServer(t, b)
 			defer closer()
@@ -61,6 +63,7 @@ func TestKVRoot(t *testing.T) {
 func TestKVNamespace(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testKVServer(t, b)
 			defer closer()
@@ -122,6 +125,7 @@ func TestKVNamespace(t *testing.T) {
 func TestKVMix(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testKVServer(t, b)
 			defer closer()
@@ -195,6 +199,7 @@ func TestKVMix(t *testing.T) {
 	}
 }
 
+// checkKVMount mounts the KV secret engine at the given path and checks if it is mounted correctly.
 func checkKVMount(ctx context.Context, client *api.Client, path string) error {
 	sys := client.Sys()
 
@@ -220,6 +225,7 @@ func checkKVMount(ctx context.Context, client *api.Client, path string) error {
 	return nil
 }
 
+// createGetKV2 creates a KV secret, retrieves it, and confirms that the data is correct.
 func createGetKV2(ctx context.Context, client *api.Client, path, name, username, password string) (*api.KVv2, error) {
 	kv2 := client.KVv2(path)
 

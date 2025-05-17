@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 )
 
 func TestPolicyRootDefault(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
@@ -55,6 +57,7 @@ func TestPolicyRootDefault(t *testing.T) {
 func TestPolicyRootCustom(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
@@ -118,6 +121,7 @@ func TestPolicyRootCustom(t *testing.T) {
 func TestPolicyNamespaceDefault(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
@@ -186,6 +190,7 @@ func TestPolicyNamespaceDefault(t *testing.T) {
 func TestPolicyNamespaceCustom(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
@@ -277,6 +282,7 @@ func TestPolicyNamespaceCustom(t *testing.T) {
 func TestPolicyMixDeleteInNamespace(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
@@ -369,6 +375,7 @@ func TestPolicyMixDeleteInNamespace(t *testing.T) {
 func TestPolicyMixDeleteInRoot(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()

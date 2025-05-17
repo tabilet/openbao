@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/openbao/openbao/api/v2"
 )
@@ -12,6 +13,7 @@ import (
 func TestPluginRoot(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, plugin, closer := testPluginServer(t, b)
 			defer closer()
@@ -53,6 +55,7 @@ func TestPluginRoot(t *testing.T) {
 func TestPluginNamespace(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, plugin, closer := testPluginServer(t, b)
 			defer closer()
@@ -106,6 +109,7 @@ func TestPluginNamespace(t *testing.T) {
 func TestPluginMix(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, plugin, closer := testPluginServer(t, b)
 			defer closer()

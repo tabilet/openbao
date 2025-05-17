@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/openbao/openbao/api/v2"
 )
@@ -12,6 +13,7 @@ import (
 func TestTokenRoot(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
@@ -45,6 +47,7 @@ func TestTokenRoot(t *testing.T) {
 func TestTokenNamespace(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
@@ -108,6 +111,7 @@ func TestTokenNamespace(t *testing.T) {
 func TestTokenMix(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
@@ -201,6 +205,7 @@ func TestTokenMix(t *testing.T) {
 	}
 }
 
+// checkTokenAuth checks if the token auth is mounted and cannot be disabled.
 func checkTokenAuth(ctx context.Context, client *api.Client, path string) error {
 	sys := client.Sys()
 
@@ -216,19 +221,20 @@ func checkTokenAuth(ctx context.Context, client *api.Client, path string) error 
 
 	err = sys.DisableAuthWithContext(ctx, path)
 	if err == nil {
-		return fmt.Errorf("Should have failed")
+		return fmt.Errorf("should have failed")
 	} else if rErr, ok := err.(*api.ResponseError); !ok || rErr.StatusCode != 400 || (rErr.Errors)[0] != "token credential backend cannot be disabled" {
 		return fmt.Errorf("%#v", rErr.Errors)
 	}
 	return nil
 }
 
-func getTokenAuthSecret(ctx context.Context, client *api.Client, rootToken, policy string) (*api.TokenAuth, *api.Secret, error) {
+// getTokenAuthSecret creates a new token from client, which is associated with a namespace, with the given policies and returns the token auth and secret.
+func getTokenAuthSecret(ctx context.Context, client *api.Client, rootToken string, policy ...string) (*api.TokenAuth, *api.Secret, error) {
 	client.SetToken(rootToken)
 
 	tokenAuth := client.Auth().Token()
 	secret, err := tokenAuth.CreateWithContext(ctx, &api.TokenCreateRequest{
-		Policies: []string{policy},
+		Policies: policy,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -236,6 +242,7 @@ func getTokenAuthSecret(ctx context.Context, client *api.Client, rootToken, poli
 	if secret.Auth == nil || secret.Auth.ClientToken == "" {
 		return nil, nil, fmt.Errorf("Auth data: %+v", secret.Auth)
 	}
+
 	token := secret.Auth.ClientToken
 	client.SetToken(token)
 	tokenAuth = client.Auth().Token()
@@ -248,8 +255,10 @@ func getTokenAuthSecret(ctx context.Context, client *api.Client, rootToken, poli
 		return nil, nil, fmt.Errorf("self response data nil: %+v", selfSecret)
 	}
 	policies := selfSecret.Data["policies"].([]any)
-	if policies[0].(string) != policy {
-		return nil, nil, fmt.Errorf("Policy %s not found.", policies)
+	for _, p := range policies {
+		if !slices.Contains(policies, any(p)) {
+			return nil, nil, fmt.Errorf("policy %s not found in %v.", p, policies)
+		}
 	}
 
 	client.SetToken(rootToken)

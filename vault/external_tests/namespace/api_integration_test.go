@@ -39,7 +39,12 @@ func cloneClient(ctx context.Context, client *api.Client, pname string) (*api.Cl
 		return nil, err
 	}
 	clone.SetToken(client.Token())
-	clone.SetNamespace(pname)
+	top := client.Namespace()
+	if top == "" {
+		clone.SetNamespace(pname)
+	} else {
+		clone.SetNamespace(top + "/" + pname)
+	}
 	return clone, nil
 }
 
@@ -66,6 +71,30 @@ func testPluginServer(t *testing.T, rest ...any) (*api.Client, pluginhelpers.Tes
 
 	cluster, client, _, closer := testVaultServerCoreConfigOpts(t, coreConfig, opts, rest...)
 	return client, cluster.Plugins[0], closer
+}
+
+// testUserpassServer creates a test vault cluster with the KV backend and returns
+// a configured API client and closer function.
+func testUserpassServer(t testing.TB, rest ...any) (*api.Client, func()) {
+	t.Helper()
+
+	// initialize test cluster
+	coreConfig := &vault.CoreConfig{
+		CredentialBackends: map[string]logical.Factory{
+			"userpass": credUserpass.Factory,
+		},
+		LogicalBackends: map[string]logical.Factory{
+			"kv":    logicalKv.Factory,
+			"kv-v2": logicalKv.VersionedKVFactory,
+		},
+	}
+	opts := &vault.TestClusterOptions{
+		HandlerFunc: http.Handler,
+		NumCores:    1,
+	}
+
+	_, client, _, closer := testVaultServerCoreConfigOpts(t, coreConfig, opts, rest...)
+	return client, closer
 }
 
 // testKVServer creates a test vault cluster with the KV backend and returns

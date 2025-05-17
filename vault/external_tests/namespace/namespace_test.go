@@ -12,6 +12,7 @@ import (
 func TestNamespace(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
@@ -42,6 +43,13 @@ func TestNamespace(t *testing.T) {
 			_, err := logical.DeleteWithContext(ctx, "sys/namespaces/dname")
 			if err == nil || !strings.HasSuffix(err.Error(), "containing child namespaces") {
 				t.Fatalf("Delete dname when ename exists: %s", err)
+			}
+			rspn, err := logical.ScanWithContext(ctx, "sys/namespaces")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if data := rspn.Data; data == nil || data["keys"].([]any)[0].(string) != "dname/" || data["keys"].([]any)[1].(string) != "dname/ename/" {
+				t.Errorf("Scan Namespace list of %s: %+v", "pname/cname", rspn.Data)
 			}
 
 			for _, ns := range []string{"ename", "dname", "cname", "pname"} {

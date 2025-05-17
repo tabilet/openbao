@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/openbao/openbao/api/auth/approle/v2"
 	"github.com/openbao/openbao/api/v2"
@@ -13,6 +14,7 @@ import (
 func TestApproleRoot(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 
@@ -71,6 +73,7 @@ func TestApproleRoot(t *testing.T) {
 func TestApproleNamespace(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
@@ -139,6 +142,7 @@ func TestApproleNamespace(t *testing.T) {
 func TestApproleMix(t *testing.T) {
 	t.Parallel()
 	for i, b := range []any{new(raftClusterOpts), new(fileOpts), nil} {
+		time.Sleep(2 * time.Second)
 		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
 			client, closer := testVaultServer(t, b)
 			defer closer()
