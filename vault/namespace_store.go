@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/go-secure-stdlib/base62"
 	uuid "github.com/hashicorp/go-uuid"
 	"github.com/openbao/openbao/helper/namespace"
+	"github.com/openbao/openbao/physical/mountable"
 	"github.com/openbao/openbao/sdk/v2/logical"
 )
 
@@ -369,6 +370,11 @@ func (ns *NamespaceStore) setNamespaceLocked(ctx context.Context, nsEntry *names
 
 	if err := ns.writeNamespace(ctx, entry); err != nil {
 		return fmt.Errorf("failed to persist namespace: %w", err)
+	} else if mountable, ok := ns.core.GetMountable(); ok {
+		// Create the necessary mounts for the new namespace.
+		if err := mountable.CreateIfNotExists(ctx, entry); err != nil {
+			return fmt.Errorf("failed to create mounts for namespace: %w", err)
+		}
 	}
 	ns.namespacesByPath.Insert(entry)
 	ns.namespacesByUUID[entry.UUID] = entry
@@ -765,6 +771,13 @@ func (ns *NamespaceStore) DeleteNamespace(ctx context.Context, path string) (str
 		delete(ns.namespacesByUUID, namespaceToDelete.UUID)
 		delete(ns.namespacesByAccessor, namespaceToDelete.ID)
 
+		if mountable, ok := ns.core.GetMountable(); ok {
+			err = mountable.DropIfExists(ctx, namespaceToDelete)
+			if err != nil {
+				ns.logger.Error("failed to drop namespace from mountable", "namespace", namespaceToDelete.Path, "error", err.Error())
+			}
+		}
+
 		view := NamespaceView(ns.storage, parent).SubView(namespaceStoreSubPath)
 		err = logical.WithTransaction(ctx, view, func(s logical.Storage) error {
 			return s.Delete(ctx, namespaceToDelete.UUID)
@@ -1012,4 +1025,9 @@ func (ns *NamespaceStore) LockNamespace(ctx context.Context, path string) (strin
 	}
 
 	return lockKey, nil
+}
+
+// GetMountable returns the mountable representation of the underlying physical storage.
+func (c *Core) GetMountable() (mountable.Mountable, bool) {
+	return mountable.PhysicalToMountable(c.underlyingPhysical)
 }

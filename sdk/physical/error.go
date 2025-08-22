@@ -154,3 +154,10 @@ func (e *errorInjectorTransaction) Commit(ctx context.Context) error {
 func (e *errorInjectorTransaction) Rollback(ctx context.Context) error {
 	return e.errorInjector.backend.(Transaction).Rollback(ctx)
 }
+
+func IsErrorInject(backend Backend) (Backend, bool) {
+	if e, ok := backend.(*errorInjector); ok {
+		return e.backend, true
+	}
+	return nil, false
+}
