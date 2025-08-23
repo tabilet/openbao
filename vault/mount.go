@@ -770,7 +770,13 @@ func (c *Core) mountInternal(ctx context.Context, entry *MountEntry, updateStora
 	// Initialize() if necessary
 	view.SetReadOnlyErr(origReadOnlyErr)
 	// initialize, using the core's active context.
-	err = backend.Initialize(c.activeContext, &logical.InitializationRequest{Storage: view})
+	// oss start
+	// I think core's active context is initialized at the unseal process.
+	// However, this mountInernal is also called after creating new namespace.
+	// In that case, the current context seems to be appropriate.
+	// err = backend.Initialize(c.activeContext, &logical.InitializationRequest{Storage: view})
+	err = backend.Initialize(ctx, &logical.InitializationRequest{Storage: view})
+	// oss end
 	if err != nil {
 		return err
 	}
