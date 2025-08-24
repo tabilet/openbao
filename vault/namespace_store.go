@@ -771,17 +771,17 @@ func (ns *NamespaceStore) DeleteNamespace(ctx context.Context, path string) (str
 		delete(ns.namespacesByUUID, namespaceToDelete.UUID)
 		delete(ns.namespacesByAccessor, namespaceToDelete.ID)
 
-		//if mountable, ok := ns.core.GetMountable(); ok {
-		//	err = mountable.DropIfExists(ctx, namespaceToDelete)
-		//	if err != nil {
-		//		ns.logger.Error("failed to drop namespace from mountable", "namespace", namespaceToDelete.Path, "error", err.Error())
-		//	}
-		//}
+		if mountable, ok := ns.core.GetMountable(); ok {
+			err = mountable.DropIfExists(ctx, namespaceToDelete)
+			if err != nil {
+				ns.logger.Error("failed to drop namespace from mountable", "namespace", namespaceToDelete.Path, "error", err.Error())
+			}
+		}
 
 		view := NamespaceView(ns.storage, parent).SubView(namespaceStoreSubPath)
 		err = logical.WithTransaction(ctx, view, func(s logical.Storage) error {
 			// oss start
-			// we shall use parent context here, to be in consistent with
+			// we shall use parent context here, to be consistent with
 			// parent in writeNamespace()
 			parentCtx := namespace.ContextWithNamespace(ctx, parent)
 			return s.Delete(parentCtx, namespaceToDelete.UUID)
