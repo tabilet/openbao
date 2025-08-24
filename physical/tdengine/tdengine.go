@@ -11,15 +11,6 @@ CREATE STABLE superbao  (
     NamespaceID VARCHAR(1024),
     NamespacePath VARCHAR(64)
 );
-
-CREATE STABLE supermount  (
-    ts timestamp,
-	k  VARCHAR(1024),
-	v  VARCHAR(128)
-) TAGS (
-    NamespaceID VARCHAR(1024),
-    NamespacePath VARCHAR(64)
-);
 */
 
 package tdengine
@@ -64,7 +55,7 @@ var (
 type TDEngineBackend struct {
 	db         *sql.DB
 	database   string
-	sTables    map[string][]string
+	stable     []string
 	logger     hclog.Logger
 	permitPool *physical.PermitPool
 	conf       map[string]string
@@ -125,9 +116,10 @@ func NewTDEngineBackend(conf map[string]string, logger hclog.Logger) (*TDEngineB
 	m := &TDEngineBackend{
 		db:       db,
 		database: database,
-		sTables: map[string][]string{
-			"stable": {"superbao", "root", "ts timestamp, k VARCHAR(4096), v VARBINARY(60000)"},
-			"smount": {"supermount", "mount", "ts timestamp, k VARCHAR(1024), v VARCHAR(128)"},
+		stable: []string{
+			"superbao",
+			"root",
+			"ts timestamp, k VARCHAR(4096), v VARBINARY(60000)",
 		},
 		logger:     logger,
 		permitPool: physical.NewPermitPool(maxParInt),
@@ -174,11 +166,10 @@ func NewTDEngineBackend(conf map[string]string, logger hclog.Logger) (*TDEngineB
 		return nil
 	}
 
-	for _, item := range m.sTables {
-		err = created2(item[0], `CREATE STABLE IF NOT EXISTS `+m.database+`.`+item[0]+` ( `+item[2]+` ) TAGS ( NamespaceID VARCHAR(1024), NamespacePath VARCHAR(64) )`, item[1])
-		if err != nil {
-			return nil, err
-		}
+	item := m.stable
+	err = created2(item[0], `CREATE STABLE IF NOT EXISTS `+m.database+`.`+item[0]+` ( `+item[2]+` ) TAGS ( NamespaceID VARCHAR(1024), NamespacePath VARCHAR(64) )`, item[1])
+	if err != nil {
+		return nil, err
 	}
 
 	return m, err
@@ -322,20 +313,12 @@ func (m *TDEngineBackend) CreateIfNotExists(ctx context.Context, ns1 *namespace.
 	}
 
 	// Create the table if it does not exist.
-	for k, item := range m.sTables {
-		var t string
-		switch k {
-		case "smount":
-			t = "mount_" + tname
-		default:
-			t = tname
-		}
-		statement := "CREATE TABLE IF NOT EXISTS " + m.database + "." + t + " USING " + m.database + "." + item[0] + ` ( NamespaceID, NamespacePath ) TAGS ( "` + id + `", "` + path + `" )`
-		_, err = m.db.Exec(statement)
-		if err != nil {
-			m.logger.Error(errTableCreate, "statement", statement, "error", err)
-			return fmt.Errorf("%s %s: %w", errTableCreate, tname, err)
-		}
+	item := m.stable
+	statement := "CREATE TABLE IF NOT EXISTS " + m.database + "." + tname + " USING " + m.database + "." + item[0] + ` ( NamespaceID, NamespacePath ) TAGS ( "` + id + `", "` + path + `" )`
+	_, err = m.db.Exec(statement)
+	if err != nil {
+		m.logger.Error(errTableCreate, "statement", statement, "error", err)
+		return fmt.Errorf("%s %s: %w", errTableCreate, tname, err)
 	}
 
 	m.logger.Debug("tdengine table created", "table", tname)
@@ -371,20 +354,11 @@ func (m *TDEngineBackend) DropIfExists(ctx context.Context, ns1 *namespace.Names
 		return fmt.Errorf("children namespace found %s", ns1)
 	}
 
-	for k := range m.sTables {
-		var t string
-		switch k {
-		case "smount":
-			t = "mount" + tname[len(namespace.RootNamespaceID):]
-		default:
-			t = tname
-		}
-		statement := "DROP TABLE IF EXISTS " + m.database + "." + t
-		_, err = m.db.Exec(statement)
-		if err != nil {
-			m.logger.Error(errTableDrop, "table", tname, "statement", statement, "error", err)
-			return fmt.Errorf("%s %w", errTableDrop, err)
-		}
+	statement := "DROP TABLE IF EXISTS " + m.database + "." + tname
+	_, err = m.db.Exec(statement)
+	if err != nil {
+		m.logger.Error(errTableDrop, "statement", statement, "error", err)
+		return fmt.Errorf("%s %w", errTableDrop, err)
 	}
 
 	m.logger.Debug("tdengine table dropped", "table", tname)
@@ -414,7 +388,7 @@ func (m *TDEngineBackend) getWithDuration(ctx context.Context, key string, durat
 		m.logger.Debug("tdengine get", "table", statement, "key", key, "record", "not found")
 		return nil, nil
 	} else if err != nil {
-		m.logger.Error("failed to query", "table", statement, "key", key, "error", err)
+		m.logger.Error("failed to query", "statement", statement, "error", err)
 		return nil, fmt.Errorf("failed to query %w", err)
 	}
 
@@ -459,7 +433,7 @@ func (m *TDEngineBackend) addWithDuration(ctx context.Context, entry *physical.E
 	key := entry.Key
 	err := m.Delete(ctx, key)
 	if err != nil {
-		return fmt.Errorf("failed to delete %w", err)
+		return fmt.Errorf("failed to delete key %s: %w", key, err)
 	}
 
 	tname, err := m.getTablename(ctx)
@@ -476,7 +450,7 @@ func (m *TDEngineBackend) addWithDuration(ctx context.Context, entry *physical.E
 	}
 	_, err = m.db.ExecContext(ctx, statement)
 	if err != nil {
-		m.logger.Error("tdengine failed to put", "key", key, "error", err)
+		m.logger.Error("tdengine failed to put", "statement", statement, "error", err)
 		return fmt.Errorf("failed to put %w", err)
 	}
 
@@ -505,7 +479,8 @@ func (m *TDEngineBackend) Delete(ctx context.Context, key string) error {
 		m.logger.Debug("tdengine delete", "key not found", key)
 		return nil
 	} else if err != nil {
-		return fmt.Errorf("failed to query %s: %w", statement, err)
+		m.logger.Error("failed to query", "statement", statement, "error", err)
+		return fmt.Errorf("failed to query first in delete %w", err)
 	}
 	defer rows.Close()
 
@@ -513,13 +488,14 @@ func (m *TDEngineBackend) Delete(ctx context.Context, key string) error {
 		var ts time.Time
 		err = rows.Scan(&ts)
 		if err != nil {
+			m.logger.Error("failed to scan", "error", err)
 			return fmt.Errorf("failed to scan ts %w", err)
 		}
 		s := strings.Split(ts.UTC().String(), " ")
 		statement = `DELETE FROM ` + tname + ` WHERE ts='` + strings.Join(s[:2], " ") + `'`
 		res, err := m.db.ExecContext(ctx, statement)
 		if err != nil {
-			m.logger.Error("failed to delete", "statement", statement, "key", key, "error", err)
+			m.logger.Error("failed to delete", "statement", statement, "error", err)
 			return fmt.Errorf("failed to delete %w", err)
 		}
 		m.logger.Trace("DELETING", "table", tname, "ts", ts.UTC(), "res", fmt.Sprintf("%#v", res))
@@ -539,9 +515,10 @@ func (m *TDEngineBackend) DeleteExpired(ctx context.Context) error {
 		return err
 	}
 
-	_, err = m.db.ExecContext(ctx, "DELETE FROM "+tname+" WHERE ts < now")
+	statement := `DELETE FROM ` + tname + ` WHERE ts < now`
+	_, err = m.db.ExecContext(ctx, statement)
 	if err != nil {
-		m.logger.Error("tdengine delete expired", "table", tname)
+		m.logger.Error("tdengine delete expired", "statement", statement, "error", err)
 	}
 	return err
 }
@@ -569,6 +546,7 @@ func (m *TDEngineBackend) Items(ctx context.Context) ([]*physical.Entry, error) 
 		var value []byte
 		err = rows.Scan(&ts, &key, &value)
 		if err != nil {
+			m.logger.Error("failed to scan", "error", err)
 			return nil, fmt.Errorf("failed to scan rows: %w", err)
 		}
 		items = append(items, &physical.Entry{
@@ -609,6 +587,7 @@ func (m *TDEngineBackend) List(ctx context.Context, prefix string) ([]string, er
 		var key string
 		err = rows.Scan(&key)
 		if err != nil {
+			m.logger.Error("failed to scan", "error", err)
 			return nil, fmt.Errorf("failed to scan rows: %w", err)
 		}
 
@@ -642,6 +621,7 @@ func (m *TDEngineBackend) ListPage(ctx context.Context, prefix string, after str
 	}
 	rows, err := m.db.QueryContext(ctx, statement)
 	if err != nil {
+		m.logger.Error("failed to list page", "statement", statement, "error", err)
 		return nil, fmt.Errorf("failed to list page: %w", err)
 	}
 	defer rows.Close()
@@ -653,6 +633,7 @@ func (m *TDEngineBackend) ListPage(ctx context.Context, prefix string, after str
 		var key string
 		err = rows.Scan(&key)
 		if err != nil {
+			m.logger.Error("failed to scan", "error", err)
 			return nil, fmt.Errorf("failed to scan rows: %w", err)
 		}
 
