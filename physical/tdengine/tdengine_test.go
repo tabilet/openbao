@@ -13,8 +13,7 @@ import (
 func backend() *TDEngineBackend {
 	logger := logging.NewVaultLogger(log.Debug)
 	bi, err := NewTDEngineBackend(map[string]string{
-		"connection_url": "root:taosdata@tcp(vm0:6030)/testbao",
-		"database":       "testbao",
+		"database": "openbao",
 	}, logger)
 	if err != nil {
 		panic(err)
@@ -41,26 +40,26 @@ func TestTDEngine_Backend(t *testing.T) {
 
 func TestTDEngine_Namespace(t *testing.T) {
 	ns := &namespace.Namespace{
-		ID:             "root/pname",
+		Path:           "pname",
 		CustomMetadata: map[string]string{},
 	}
 
-	if tbl := tablename(ns); tbl != "root_pname" {
+	if tbl := tablename(ns); tbl != "pname" {
 		t.Fatalf("Namespace table name does not match")
 	}
 
-	ns.ID = "root/pname/cname"
-	if tbl := tablename(ns); tbl != "root_pname_cname" {
+	ns.Path = "pname/cname"
+	if tbl := tablename(ns); tbl != "pname_cname" {
 		t.Fatalf("Namespace table name does not match")
 	}
 
-	ns.ID = "root/pname/cname/dname"
-	if tbl := tablename(ns); tbl != "root_pname_cname_dname" {
+	ns.Path = "pname/cname/dname"
+	if tbl := tablename(ns); tbl != "pname_cname_dname" {
 		t.Fatalf("Namespace table name does not match")
 	}
 
-	ns.ID = "root/pname/cname/dname/ename"
-	if tbl := tablename(ns); tbl != "root_pname_cname_dname_ename" {
+	ns.Path = "pname/cname/dname/ename"
+	if tbl := tablename(ns); tbl != "pname_cname_dname_ename" {
 		t.Fatalf("Namespace table name does not match")
 	}
 
@@ -78,73 +77,7 @@ func TestTDEngine_Namespace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get table name: %v", err)
 	}
-	if tname != "openbao.root_pname_cname_dname_ename" {
+	if tname != "openbao.pname_cname_dname_ename" {
 		t.Errorf("Table name does not match %s", tname)
 	}
 }
-
-/*
-func TestTDEngine_TablesCreateDrop(t *testing.T) {
-	b := backend()
-	ns := &namespace.Namespace{
-		ID:             "root",
-		CustomMetadata: map[string]string{},
-	}
-
-	ctx := namespace.ContextWithNamespace(context.Background(), ns)
-	if err := b.CreateIfNotExists(ctx, "pname"); err != nil {
-		t.Fatalf("Failed to create table: %v", err)
-	}
-
-	ns.ID = "root/pname"
-	ctx = namespace.ContextWithNamespace(context.Background(), ns)
-	if err := b.CreateIfNotExists(ctx, "cname"); err != nil {
-		t.Fatalf("Failed to create table: %v", err)
-	}
-
-	ns.ID = "root/pname/cname"
-	ctx = namespace.ContextWithNamespace(context.Background(), ns)
-	if err := b.CreateIfNotExists(ctx, "dname"); err != nil {
-		t.Fatalf("Failed to create table: %v", err)
-	}
-
-	ns.ID = "root/pname/cname/dname"
-	ctx = namespace.ContextWithNamespace(context.Background(), ns)
-	if err := b.CreateIfNotExists(ctx, "ename"); err != nil {
-		t.Fatalf("Failed to create table: %v", err)
-	}
-
-	ns.ID = "root/pname/cname"
-	ctx = namespace.ContextWithNamespace(context.Background(), ns)
-	if err := b.DropIfExists(ctx, "ename"); err.Error() != "namespace not found ename" {
-		t.Fatalf("Failed to drop table: %v", err)
-	}
-	if err := b.DropIfExists(ctx, "dname"); err.Error() != "children namespace found dname" {
-		t.Fatalf("Failed to drop table: %v", err)
-	}
-
-	ns.ID = "root/pname/cname/dname"
-	ctx = namespace.ContextWithNamespace(context.Background(), ns)
-	if err := b.DropIfExists(ctx, "ename"); err != nil {
-		t.Fatalf("Failed to drop table: %v", err)
-	}
-
-	ns.ID = "root/pname/cname"
-	ctx = namespace.ContextWithNamespace(context.Background(), ns)
-	if err := b.DropIfExists(ctx, "dname"); err != nil {
-		t.Fatalf("Failed to drop table: %v", err)
-	}
-
-	ns.ID = "root/pname"
-	ctx = namespace.ContextWithNamespace(context.Background(), ns)
-	if err := b.DropIfExists(ctx, "cname"); err != nil {
-		t.Fatalf("Failed to drop table: %v", err)
-	}
-
-	ns.ID = "root"
-	ctx = namespace.ContextWithNamespace(context.Background(), ns)
-	if err := b.DropIfExists(ctx, "pname"); err != nil {
-		t.Fatalf("Failed to drop table: %v", err)
-	}
-}
-*/

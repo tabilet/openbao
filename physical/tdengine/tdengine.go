@@ -62,7 +62,7 @@ func NewTDEnginePhysicalBackend(conf map[string]string, logger hclog.Logger) (ph
 // NewTDEngineBackend constructs a TDEngine backend using the given API client and
 // server address and credential for accessing tdengine database.
 func NewTDEngineBackend(conf map[string]string, logger hclog.Logger) (*TDEngineBackend, error) {
-	connURL := api.ReadBaoVariable("TDENGINE_CONNECTION_URL")
+	connURL := api.ReadBaoVariable("TDE_CONNECTION_URL")
 	if v, ok := conf["connection_url"]; ok {
 		connURL = v
 	}
@@ -70,7 +70,7 @@ func NewTDEngineBackend(conf map[string]string, logger hclog.Logger) (*TDEngineB
 		return nil, fmt.Errorf("missing connection_url parameter")
 	}
 
-	database := api.ReadBaoVariable("TDENGINE_DATABASE")
+	database := api.ReadBaoVariable("TDE_DATABASE")
 	if v, ok := conf["database"]; ok {
 		database = v
 	}
