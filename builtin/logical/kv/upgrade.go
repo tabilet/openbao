@@ -234,7 +234,16 @@ func (b *versionedKVBackend) Upgrade(ctx context.Context, s logical.Storage) err
 		}
 
 		b.Logger().Info("collecting keys to upgrade")
-		keys, err := logical.CollectKeys(ctx, s)
+		// oss start
+		// in case of no HA backend, CollectKeys fails.
+		// we need to use CollectKeysWithPrefix
+		// keys, err := logical.CollectKeys(ctx, s)
+		prefix := b.storagePrefix
+		if prefix != "" && !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+		keys, err := logical.CollectKeysWithPrefix(ctx, s, prefix)
+		// oss end
 		if err != nil {
 			b.Logger().Error("upgrading resulted in error", "error", err)
 			return

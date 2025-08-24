@@ -181,7 +181,11 @@ func CollectKeysWithPrefixWithLogger(ctx context.Context, view ClearableView, lo
 	var keys []string
 
 	cb := func(path string) {
-		if strings.HasPrefix(path, prefix) {
+		// oss start
+		// don't include the path equals the prefix
+		// if strings.HasSuffix(path, prefix) {
+		if strings.HasPrefix(path, prefix) && len(path) != len(prefix) {
+			// oss end
 			keys = append(keys, path)
 		}
 	}
