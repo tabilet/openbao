@@ -132,6 +132,7 @@ require (
 	github.com/sethvargo/go-limiter v1.0.0
 	github.com/shirou/gopsutil/v4 v4.25.6
 	github.com/stretchr/testify v1.10.0
+	github.com/taosdata/driver-go/v3 v3.7.4
 	github.com/tink-crypto/tink-go/v2 v2.4.0
 	github.com/yeqown/go-qrcode/v2 v2.2.5
 	go.etcd.io/bbolt v1.4.3
