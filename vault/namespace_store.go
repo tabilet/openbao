@@ -803,7 +803,6 @@ func (ns *NamespaceStore) DeleteNamespace(ctx context.Context, path string) (str
 			parentCtx := namespace.ContextWithNamespace(ctx, parent)
 			return s.Delete(parentCtx, namespaceToDelete.UUID)
 			// oss end
-
 		})
 		if err != nil {
 			ns.logger.Error("failed to delete namespace storage", "namespace", namespaceToDelete.Path, "error", err.Error())

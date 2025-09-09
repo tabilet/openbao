@@ -775,7 +775,6 @@ func (c *Core) mountInternal(ctx context.Context, entry *MountEntry, updateStora
 	// err = backend.Initialize(c.activeContext, &logical.InitializationRequest{Storage: view})
 	err = backend.Initialize(ctx, &logical.InitializationRequest{Storage: view})
 	// oss end
-
 	if err != nil {
 		return err
 	}
