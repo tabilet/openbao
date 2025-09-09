@@ -21,6 +21,7 @@ import (
 	uuid "github.com/hashicorp/go-uuid"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/sdk/v2/logical"
+	"github.com/openbao/openbao/sdk/v2/physical"
 )
 
 // Namespace id length; upstream uses 5 characters so we use one more to
@@ -380,7 +381,15 @@ func (ns *NamespaceStore) setNamespaceLocked(ctx context.Context, nsEntry *names
 
 	if err := ns.writeNamespace(ctx, entry); err != nil {
 		return fmt.Errorf("failed to persist namespace: %w", err)
+		// oss start
+		// Create the necessary mountable table for the new namespace.
+	} else if ma, ok := ns.core.GetMountable(); ok {
+		if err := ma.CreateIfNotExists(ctx, entry.Path); err != nil {
+			return fmt.Errorf("failed to create mountable for namespace: %w", err)
+		}
+		// oss end
 	}
+
 	ns.namespacesByPath.Insert(entry)
 	ns.namespacesByUUID[entry.UUID] = entry
 	ns.namespacesByAccessor[entry.ID] = entry
@@ -776,9 +785,25 @@ func (ns *NamespaceStore) DeleteNamespace(ctx context.Context, path string) (str
 		delete(ns.namespacesByUUID, namespaceToDelete.UUID)
 		delete(ns.namespacesByAccessor, namespaceToDelete.ID)
 
+		// oss start
+		// drop the empty table for the deleted namespace
+		if ma, ok := ns.core.GetMountable(); ok {
+			err = ma.DropIfExists(ctx, namespaceToDelete.Path)
+			if err != nil {
+				ns.logger.Error("failed to drop namespace from mountable", "namespace", namespaceToDelete.Path, "error", err.Error())
+			}
+		}
+		// oss end
+
 		view := NamespaceView(ns.storage, parent).SubView(namespaceStoreSubPath)
 		err = logical.WithTransaction(ctx, view, func(s logical.Storage) error {
-			return s.Delete(ctx, namespaceToDelete.UUID)
+			// oss start
+			// using parent context is consistent with parent in writeNamespace
+			// return s.Delete(ctx, namespaceToDelete.UUID)
+			parentCtx := namespace.ContextWithNamespace(ctx, parent)
+			return s.Delete(parentCtx, namespaceToDelete.UUID)
+			// oss end
+
 		})
 		if err != nil {
 			ns.logger.Error("failed to delete namespace storage", "namespace", namespaceToDelete.Path, "error", err.Error())
@@ -1024,3 +1049,11 @@ func (ns *NamespaceStore) LockNamespace(ctx context.Context, path string) (strin
 
 	return lockKey, nil
 }
+
+// oss start
+// GetMountable returns the mountable representation of the underlying physical storage.
+func (c *Core) GetMountable() (physical.Mountable, bool) {
+	return physical.PhysicalToMountable(c.underlyingPhysical)
+}
+
+// oss end

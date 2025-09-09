@@ -61,9 +61,16 @@ func (t *PostgreSQLBackendTransaction) Put(ctx context.Context, entry *physical.
 		return physical.ErrTransactionAlreadyCommitted
 	}
 
-	parentPath, path, key := t.b.splitKey(entry.Key)
+	m := t.b
+	tname, err := m.getTablename(ctx)
+	if err != nil {
+		m.logger.Error("failed to get table name for namespace", "error", err)
+		return err
+	}
 
-	_, err := t.tx.ExecContext(ctx, t.b.put_query, parentPath, path, key, entry.Value)
+	parentPath, path, key := m.splitKey(entry.Key)
+
+	_, err = t.tx.ExecContext(ctx, put_query(tname), parentPath, path, key, entry.Value)
 	if err != nil {
 		return err
 	}
@@ -82,9 +89,15 @@ func (t *PostgreSQLBackendTransaction) Delete(ctx context.Context, fullPath stri
 		return physical.ErrTransactionAlreadyCommitted
 	}
 
-	_, path, key := t.b.splitKey(fullPath)
+	m := t.b
+	tname, err := m.getTablename(ctx)
+	if err != nil {
+		return err
+	}
 
-	_, err := t.tx.ExecContext(ctx, t.b.delete_query, path, key)
+	_, path, key := m.splitKey(fullPath)
+
+	_, err = t.tx.ExecContext(ctx, delete_query(tname), path, key)
 	if err != nil {
 		return err
 	}
@@ -100,10 +113,16 @@ func (t *PostgreSQLBackendTransaction) Get(ctx context.Context, fullPath string)
 		return nil, physical.ErrTransactionAlreadyCommitted
 	}
 
-	_, path, key := t.b.splitKey(fullPath)
+	m := t.b
+	tname, err := m.getTablename(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	_, path, key := m.splitKey(fullPath)
 
 	var result []byte
-	err := t.tx.QueryRowContext(ctx, t.b.get_query, path, key).Scan(&result)
+	err = t.tx.QueryRowContext(ctx, get_query(tname), path, key).Scan(&result)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -126,7 +145,13 @@ func (t *PostgreSQLBackendTransaction) List(ctx context.Context, prefix string) 
 		return nil, physical.ErrTransactionAlreadyCommitted
 	}
 
-	rows, err := t.tx.QueryContext(ctx, t.b.list_query, "/"+prefix)
+	m := t.b
+	tname, err := m.getTablename(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := t.tx.QueryContext(ctx, list_query(tname), "/"+prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -154,12 +179,17 @@ func (t *PostgreSQLBackendTransaction) ListPage(ctx context.Context, prefix stri
 		return nil, physical.ErrTransactionAlreadyCommitted
 	}
 
+	m := t.b
+	tname, err := m.getTablename(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var rows *sql.Rows
-	var err error
 	if limit <= 0 {
-		rows, err = t.tx.QueryContext(ctx, t.b.list_page_query, "/"+prefix, after)
+		rows, err = t.tx.QueryContext(ctx, list_page_query(tname), "/"+prefix, after)
 	} else {
-		rows, err = t.tx.QueryContext(ctx, t.b.list_page_limited_query, "/"+prefix, after, limit)
+		rows, err = t.tx.QueryContext(ctx, list_page_limited_query(tname), "/"+prefix, after, limit)
 	}
 	if err != nil {
 		return nil, err
