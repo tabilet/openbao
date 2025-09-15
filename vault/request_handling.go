@@ -57,6 +57,15 @@ var (
 	// to complete, unless overridden on a per-handler basis
 	DefaultMaxRequestDuration = 90 * time.Second
 
+	// DefaultMaxJsonMemory is the estimated amount of memory consumed by
+	// the output representation of the JSON request body, unless overridden on
+	// a per-listener basis.
+	DefaultMaxJsonMemory = int64(32*1024*1024 + 512*1024)
+
+	// DefaultMaxJsonStrings is the number of separate JSON strings
+	// allowed in a request body, unless overridden on a per-listener basis.
+	DefaultMaxJsonStrings = int64(1000)
+
 	ErrNoApplicablePolicies = errors.New("no applicable policies")
 	ErrPolicyNotExist       = errors.New("policy does not exist")
 

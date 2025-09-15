@@ -339,12 +339,23 @@ func handleAuditNonLogical(core *vault.Core, h http.Handler) http.Handler {
 // are performed.
 func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerProperties) http.Handler {
 	var maxRequestDuration time.Duration
+	var maxRequestJsonMemory int64
+	var maxRequestJsonStrings int64
 	if props.ListenerConfig != nil {
 		maxRequestDuration = props.ListenerConfig.MaxRequestDuration
+		maxRequestJsonMemory = props.ListenerConfig.MaxRequestJsonMemory
+		maxRequestJsonStrings = props.ListenerConfig.MaxRequestJsonStrings
 	}
 	if maxRequestDuration == 0 {
 		maxRequestDuration = vault.DefaultMaxRequestDuration
 	}
+	if maxRequestJsonMemory == 0 {
+		maxRequestJsonMemory = vault.DefaultMaxJsonMemory
+	}
+	if maxRequestJsonStrings == 0 {
+		maxRequestJsonStrings = vault.DefaultMaxJsonStrings
+	}
+
 	// Swallow this error since we don't want to pollute the logs and we also don't want to
 	// return an HTTP error here. This information is best effort.
 	hostname, _ := os.Hostname()
@@ -385,6 +396,10 @@ func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerPr
 			// Setting the namespace in the header to be included in the response
 			nw.Header().Set(consts.NamespaceHeaderName, nsHeader)
 		}
+
+		// Safely limit our input JSON
+		ctx = addMaximumJsonMemoryToContext(ctx, maxRequestJsonMemory)
+		ctx = addMaximumJsonStringsToContext(ctx, maxRequestJsonStrings)
 
 		ctx = namespace.ContextWithNamespaceHeader(ctx, nsHeader)
 		r = r.WithContext(ctx)
@@ -731,13 +746,18 @@ func parseQuery(values url.Values) map[string]interface{} {
 }
 
 func parseJSONRequest(r *http.Request, w http.ResponseWriter, out interface{}) (io.ReadCloser, error) {
-	// Limit the maximum number of bytes to MaxRequestSize to protect
-	// against an indefinite amount of data being read.
-	reader := r.Body
-	err := jsonutil.DecodeJSONFromReader(reader, out)
+	ctx := r.Context()
+
+	reader, _, _, err := NewSafeJSONReader(ctx, r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to limit JSON input: %w", err)
+	}
+
+	err = jsonutil.DecodeJSONFromReader(reader, out)
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("failed to parse JSON input: %w", err)
 	}
+
 	return nil, err
 }
 
