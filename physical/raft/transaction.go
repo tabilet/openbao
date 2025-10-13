@@ -38,7 +38,7 @@ var defaultVerifyHash = sha384VerifyHash
 
 // Bytes of overhead a single Put entry has versus a transaction, excluding
 // the size of the path. Verified by TestRaft_Backend_PutTxnMargin.
-const maxEntrySizeMultipleTxnOverhead = 11
+const maxEntrySizeMultipleTxnOverhead = 15
 
 // Parameters to send on the beginTxOp
 type beginTxOpParams struct {
