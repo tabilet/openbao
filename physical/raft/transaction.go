@@ -262,7 +262,11 @@ func (t *RaftTransaction) Put(ctx context.Context, entry *physical.Entry) error 
 			// It is safe to go to the underlying transaction here as we
 			// hold an exclusive write lock here and so there's no parallel
 			// writers to the same key.
-			value := t.tx.Bucket(dataBucketName).Get([]byte(entry.Key))
+			bucketName, err := t.b.fsm.getBucketname(ctx)
+			if err != nil {
+				return err
+			}
+			value := t.tx.Bucket(bucketName).Get([]byte(entry.Key))
 			contentsHash, err := createVerificationEntry(entry.Key, value)
 			if err != nil {
 				return err
@@ -324,7 +328,11 @@ func (t *RaftTransaction) Get(ctx context.Context, key string) (*physical.Entry,
 	}
 
 	// Otherwise, ask the underlying transaction for this value.
-	value := t.tx.Bucket(dataBucketName).Get([]byte(key))
+	bucketName, err := t.b.fsm.getBucketname(ctx)
+	if err != nil {
+		return nil, err
+	}
+	value := t.tx.Bucket(bucketName).Get([]byte(key))
 
 	if _, present := t.reads[key]; !present {
 		// Hash the contents so that we can add a verify operation.
@@ -373,7 +381,11 @@ func (t *RaftTransaction) Delete(ctx context.Context, key string) error {
 		// we have.
 		if _, present := t.reads[key]; !present {
 			// See notes above in Put(...) for why this is safe.
-			value := t.tx.Bucket(dataBucketName).Get([]byte(key))
+			bucketName, err := t.b.fsm.getBucketname(ctx)
+			if err != nil {
+				return err
+			}
+			value := t.tx.Bucket(bucketName).Get([]byte(key))
 			contentsHash, err := createVerificationEntry(key, value)
 			if err != nil {
 				return err
@@ -454,7 +466,11 @@ func (t *RaftTransaction) ListPage(ctx context.Context, prefix string, after str
 	}
 
 	// Assume the bucket exists and has keys.
-	c := t.tx.Bucket(dataBucketName).Cursor()
+	bucketName, err := t.b.fsm.getBucketname(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c := t.tx.Bucket(bucketName).Cursor()
 
 	// Build a map of updates and deletions (in the prefix!) for fast lookup.
 	deletions := map[string]struct{}{}
@@ -673,7 +689,13 @@ func (t *RaftTransaction) Commit(ctx context.Context) error {
 		return err
 	}
 
+	bucketName, err := t.b.fsm.getBucketnameString(ctx)
+	if err != nil {
+		return err
+	}
+
 	log := &LogData{
+		BucketName: &bucketName,
 		// While list operations may contribute more (if the list was issued
 		// with the same prefix with different after and limit values), this
 		// is a good approximation as to the size of the operation log and
@@ -1058,7 +1080,7 @@ func (s *fsmTxnCommitIndexApplicationState) doVerifyList(tx *bolt.Tx, b *bolt.Bu
 	metrics.IncrCounter([]string{"raft-storage", "txn_fast_apply_miss"}, 1)
 
 	var keys []string
-	keys, err = listPageInner(context.Background(), tx, params.Prefix, params.After, params.Limit)
+	keys, err = listPageInner(context.Background(), b, params.Prefix, params.After, params.Limit)
 	if err == nil {
 		err = doVerifyList(op.Key, keys, op.Value)
 	}

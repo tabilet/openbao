@@ -770,11 +770,8 @@ func (c *Core) mountInternal(ctx context.Context, entry *MountEntry, updateStora
 	// Initialize() if necessary
 	view.SetReadOnlyErr(origReadOnlyErr)
 	// initialize, using the core's active context.
-	// oss start
-	// after creating new namespace, using the current context is appropriate.
-	// err = backend.Initialize(c.activeContext, &logical.InitializationRequest{Storage: view})
+	// PNPT, per-namespace-per-table: after a new namespace is created, use the current context.
 	err = backend.Initialize(ctx, &logical.InitializationRequest{Storage: view})
-	// oss end
 	if err != nil {
 		return err
 	}

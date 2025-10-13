@@ -26,6 +26,9 @@ message LogData {
 
 	// LowestActiveIndex is optional, the start index of the oldest (therefore lowest) active transaction
 	optional uint64 lowest_active_index = 2;
+
+	// BucketName is the bucket for data
+	optional string bucket_name = 3;
 }
 
 message IndexValue {

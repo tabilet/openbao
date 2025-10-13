@@ -30,7 +30,7 @@ func getFSM(t testing.TB) (*FSM, string) {
 		Level: hclog.Trace,
 	})
 
-	fsm, err := NewFSM(raftDir, "", logger)
+	fsm, err := NewFSM(raftDir, "", false, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

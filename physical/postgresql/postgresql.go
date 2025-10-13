@@ -209,8 +209,8 @@ func NewPostgreSQLBackend(conf map[string]string, logger log.Logger) (physical.B
 		haDeleteLockExec:         haDeleteLockExec(quoted_ha_table),
 		logger:                   logger,
 		txnPermitPool:            physical.NewPermitPool(txnMaxParInt),
-		haEnabled:                conf["ha_enabled"] == "true",
-		mEnabled:                 conf["m_enabled"] == "true",
+		haEnabled:                strings.ToLower(conf["ha_enabled"]) == "true",
+		mEnabled:                 strings.ToLower(conf["m_enabled"]) == "true",
 	}
 
 	// Determine if we should create tables.
@@ -346,34 +346,16 @@ func (m *PostgreSQLBackend) getTablename(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("namespace in ctx error: %w", err)
 	}
 
-	path := ns.Path
-	if path == "" {
-		return m.table, nil
-	} else {
-		path = strings.Trim(path, "/")
-	}
-	x := strings.ReplaceAll(strings.ReplaceAll(path, "-", ""), "/", "_")
-
-	return dbutil.QuoteIdentifier(x), nil
+	return getTableUUID(ns.UUID), nil
 }
 
-// getChildName returns table name, which is NOT quoted
-func getChildName(path string) (string, error) {
-	tname := strings.Trim(path, "/")
-	if strings.Contains(tname, "_") {
-		return "", fmt.Errorf("invalid namespace path %s", tname)
+// getTableUUID returns quoted table name from uuid
+func getTableUUID(uuid string) string {
+	if uuid == namespace.RootNamespaceUUID {
+		return dbutil.QuoteIdentifier("openbao_kv_store")
 	}
 
-	tname = strings.ReplaceAll(strings.ReplaceAll(tname, "-", ""), "/", "_")
-	return tname, nil
-}
-
-// existingChildren checks if there are any child tables for the given quoted table name
-func (m *PostgreSQLBackend) existingChildren(tname string) (bool, error) {
-	n := len(tname)
-	x := `'` + tname[1:n-1] + `_%'`
-	statement := `SELECT 1 from information_schema.tables WHERE table_name LIKE ` + x + ` AND table_catalog = 'openbao'`
-	return m.existing(statement)
+	return dbutil.QuoteIdentifier(uuid)
 }
 
 // existingTable checks if the given quoted table name exists in the database
@@ -396,7 +378,7 @@ func (m *PostgreSQLBackend) existing(statement string) (bool, error) {
 }
 
 // CreateIfNotExists creates the table if it does not exist.
-func (m *PostgreSQLBackend) CreateIfNotExists(ctx context.Context, path string) error {
+func (m *PostgreSQLBackend) CreateIfNotExists(ctx context.Context, _, uuid string) error {
 	if !m.mEnabled {
 		return nil
 	}
@@ -411,15 +393,10 @@ func (m *PostgreSQLBackend) CreateIfNotExists(ctx context.Context, path string) 
 		return err
 	} else if !parentExist {
 		m.logger.Error("parent namespace not found", "parent", parent)
-		return fmt.Errorf("parent namespace not found")
+		return fmt.Errorf("parent namespace not found: %s", parent)
 	}
 
-	tname, err := getChildName(path)
-	if err != nil {
-		return err
-	}
-
-	return m.createTables(dbutil.QuoteIdentifier(tname))
+	return m.createTables(getTableUUID(uuid))
 }
 
 func (m *PostgreSQLBackend) createTables(mtable string, hatable ...string) error {
@@ -491,7 +468,7 @@ func (m *PostgreSQLBackend) createTables(mtable string, hatable ...string) error
 }
 
 // DropIfExists drop the table if it exists.
-func (m *PostgreSQLBackend) DropIfExists(ctx context.Context, path string) error {
+func (m *PostgreSQLBackend) DropIfExists(ctx context.Context, _, uuid string) error {
 	if !m.mEnabled {
 		return nil
 	}
@@ -505,15 +482,12 @@ func (m *PostgreSQLBackend) DropIfExists(ctx context.Context, path string) error
 
 	defer txn.Rollback()
 
-	tname, err := getChildName(path)
-	if err != nil {
-		return err
-	} else if tname == "openbao_kv_store" {
+	tname := getTableUUID(uuid)
+	if tname == dbutil.QuoteIdentifier("openbao_kv_store") {
 		// Skip dropping the KV store table
 		m.logger.Debug("skipping drop root table for openbao_kv_store")
 		return nil
 	}
-	tname = dbutil.QuoteIdentifier(tname)
 
 	tableExist, err := m.existingTable(tname)
 	if err != nil {
@@ -521,14 +495,6 @@ func (m *PostgreSQLBackend) DropIfExists(ctx context.Context, path string) error
 	} else if !tableExist {
 		m.logger.Debug("namespace table not found", "tname", tname)
 		return nil
-	}
-
-	tagExist, err := m.existingChildren(tname)
-	if err != nil {
-		return err
-	} else if tagExist {
-		m.logger.Error("children namespace found", "table", tname)
-		return fmt.Errorf("children namespace found %s", path)
 	}
 
 	statement := "DROP TABLE IF EXISTS " + tname

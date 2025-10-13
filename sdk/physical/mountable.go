@@ -1,3 +1,6 @@
+// Copyright (c) 2025 OpenBao a Series of LF Projects, LLC
+// SPDX-License-Identifier: MPL-2.0
+
 package physical
 
 import (
@@ -5,8 +8,8 @@ import (
 )
 
 type Mountable interface {
-	CreateIfNotExists(ctx context.Context, path string) error
-	DropIfExists(ctx context.Context, path string) error
+	CreateIfNotExists(ctx context.Context, path, uuid string) error
+	DropIfExists(ctx context.Context, path, uuid string) error
 }
 
 // PhysicalToMountable verifies if a physical backend is also mountable

@@ -585,7 +585,7 @@ func TestBoltSnapshotStore_Listing(t *testing.T) {
 		Level: hclog.Trace,
 	})
 
-	fsm, err := NewFSM(parent, "", logger)
+	fsm, err := NewFSM(parent, "", false, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -650,7 +650,7 @@ func TestBoltSnapshotStore_CreateInstallSnapshot(t *testing.T) {
 		Level: hclog.Trace,
 	})
 
-	fsm, err := NewFSM(parent, "", logger)
+	fsm, err := NewFSM(parent, "", false, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -748,7 +748,7 @@ func TestBoltSnapshotStore_CreateInstallSnapshot(t *testing.T) {
 		t.Fatal("expected snapshot installer object")
 	}
 
-	newFSM, err := NewFSM(filepath.Dir(installer.Filename()), "", logger)
+	newFSM, err := NewFSM(filepath.Dir(installer.Filename()), "", false, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -807,7 +807,7 @@ func TestBoltSnapshotStore_CreateInstallSnapshot(t *testing.T) {
 
 		// Close/Reopen the db and make sure we still match
 		fsm.Close()
-		fsm, err = NewFSM(parent, "", logger)
+		fsm, err = NewFSM(parent, "", false, logger)
 		if err != nil {
 			t.Fatal(err)
 		}
