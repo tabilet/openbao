@@ -130,15 +130,12 @@ func (b *versionedKVBackend) Upgrade(ctx context.Context, s logical.Storage) err
 	}
 
 	// Because this is a long running process we need a new context.
-	// oss start
-	// to ensure that we are using the correct namespace for the upgrade process.
-	// ctx = context.Background()
+	// PNPT: to ensure that we are using the correct namespace context.
 	namespaceCtx, err := namespace.FromContext(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get namespace from context: %w", err)
 	}
 	ctx = namespace.ContextWithNamespace(context.Background(), namespaceCtx)
-	// oss end
 
 	upgradeKey := func(key string) error {
 		if strings.HasPrefix(key, b.storagePrefix) {
@@ -243,15 +240,12 @@ func (b *versionedKVBackend) Upgrade(ctx context.Context, s logical.Storage) err
 		}
 
 		b.Logger().Info("collecting keys to upgrade")
-		// oss start
-		// to collect keys that are under the storage prefix only
-		// keys, err := logical.CollectKeys(ctx, s)
+		// PNPT: to collect keys that are under the storage prefix only
 		prefix := b.storagePrefix
 		if prefix != "" && !strings.HasSuffix(prefix, "/") {
 			prefix += "/"
 		}
 		keys, err := logical.CollectKeysWithPrefix(ctx, s, prefix)
-		// oss end
 		if err != nil {
 			b.Logger().Error("upgrading resulted in error", "error", err)
 			return

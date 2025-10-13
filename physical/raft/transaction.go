@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash"
+	"maps"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+	"github.com/openbao/openbao/sdk/v2/helper/pointerutil"
 	"github.com/openbao/openbao/sdk/v2/physical"
 	bolt "go.etcd.io/bbolt"
 )
@@ -35,7 +38,7 @@ var defaultVerifyHash = sha384VerifyHash
 
 // Bytes of overhead a single Put entry has versus a transaction, excluding
 // the size of the path. Verified by TestRaft_Backend_PutTxnMargin.
-const maxEntrySizeMultipleTxnOverhead = 11
+const maxEntrySizeMultipleTxnOverhead = 15
 
 // Parameters to send on the beginTxOp
 type beginTxOpParams struct {
@@ -259,7 +262,11 @@ func (t *RaftTransaction) Put(ctx context.Context, entry *physical.Entry) error 
 			// It is safe to go to the underlying transaction here as we
 			// hold an exclusive write lock here and so there's no parallel
 			// writers to the same key.
-			value := t.tx.Bucket(dataBucketName).Get([]byte(entry.Key))
+			bucketName, err := t.b.fsm.getBucketname(ctx)
+			if err != nil {
+				return err
+			}
+			value := t.tx.Bucket(bucketName).Get([]byte(entry.Key))
 			contentsHash, err := createVerificationEntry(entry.Key, value)
 			if err != nil {
 				return err
@@ -321,7 +328,11 @@ func (t *RaftTransaction) Get(ctx context.Context, key string) (*physical.Entry,
 	}
 
 	// Otherwise, ask the underlying transaction for this value.
-	value := t.tx.Bucket(dataBucketName).Get([]byte(key))
+	bucketName, err := t.b.fsm.getBucketname(ctx)
+	if err != nil {
+		return nil, err
+	}
+	value := t.tx.Bucket(bucketName).Get([]byte(key))
 
 	if _, present := t.reads[key]; !present {
 		// Hash the contents so that we can add a verify operation.
@@ -370,7 +381,11 @@ func (t *RaftTransaction) Delete(ctx context.Context, key string) error {
 		// we have.
 		if _, present := t.reads[key]; !present {
 			// See notes above in Put(...) for why this is safe.
-			value := t.tx.Bucket(dataBucketName).Get([]byte(key))
+			bucketName, err := t.b.fsm.getBucketname(ctx)
+			if err != nil {
+				return err
+			}
+			value := t.tx.Bucket(bucketName).Get([]byte(key))
 			contentsHash, err := createVerificationEntry(key, value)
 			if err != nil {
 				return err
@@ -451,7 +466,11 @@ func (t *RaftTransaction) ListPage(ctx context.Context, prefix string, after str
 	}
 
 	// Assume the bucket exists and has keys.
-	c := t.tx.Bucket(dataBucketName).Cursor()
+	bucketName, err := t.b.fsm.getBucketname(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c := t.tx.Bucket(bucketName).Cursor()
 
 	// Build a map of updates and deletions (in the prefix!) for fast lookup.
 	deletions := map[string]struct{}{}
@@ -624,6 +643,10 @@ func (t *RaftTransaction) Commit(ctx context.Context) error {
 	defer func() {
 		if t.writable {
 			t.b.fsm.fastTxnTracker.completeTransaction(t.index)
+
+			// in "Rollback" we call fastTxnTracker.clearOldEntries(...) at this
+			// We don't do this in "Commit" because it will be called from the fsm.
+			// This ensures the cleanup also happens on standby nodes
 		}
 
 		t.b.fsm.l.RUnlock()
@@ -666,7 +689,13 @@ func (t *RaftTransaction) Commit(ctx context.Context) error {
 		return err
 	}
 
+	bucketName, err := t.b.fsm.getBucketnameString(ctx)
+	if err != nil {
+		return err
+	}
+
 	log := &LogData{
+		BucketName: &bucketName,
 		// While list operations may contribute more (if the list was issued
 		// with the same prefix with different after and limit values), this
 		// is a good approximation as to the size of the operation log and
@@ -706,6 +735,8 @@ func (t *RaftTransaction) Commit(ctx context.Context) error {
 		OpType: commitTxOp,
 	})
 
+	lowestActiveIndex := t.b.fsm.fastTxnTracker.lowestActiveIndexAfterCommit(t.index)
+
 	// Acquire a regular operation permit pool entry to let us access the
 	// underlying storage.
 	t.b.permitPool.Acquire()
@@ -715,6 +746,7 @@ func (t *RaftTransaction) Commit(ctx context.Context) error {
 	// the transaction application in Raft, applyLog will gather it for us
 	// and return it as a proper error.
 	t.b.l.RLock()
+	log.LowestActiveIndex = pointerutil.Ptr(min(lowestActiveIndex, t.b.raft.AppliedIndex()-1)) // we need to cap the lowest active index, otherwise we might miss transaction started later
 	err = t.b.applyLog(ctx, log)
 	t.b.l.RUnlock()
 
@@ -735,6 +767,12 @@ func (t *RaftTransaction) Rollback(ctx context.Context) error {
 	// Also unlock the read lock on the underlying fsm.
 	defer func() {
 		if t.writable {
+			lowestActiveIndex := t.b.fsm.fastTxnTracker.lowestActiveIndexAfterCommit(t.index)
+			t.b.l.RLock()
+			lowestActiveIndex = min(lowestActiveIndex, t.b.raft.AppliedIndex()-1) // we need to cap the lowest active index, otherwise we might miss transaction started later
+			t.b.l.RUnlock()
+
+			t.b.fsm.fastTxnTracker.clearOldEntries(lowestActiveIndex)
 			t.b.fsm.fastTxnTracker.completeTransaction(t.index)
 		}
 
@@ -790,6 +828,32 @@ func FsmTxnCommitIndexTracker() *fsmTxnCommitIndexTracker {
 	}
 }
 
+// lowestActiveIndexAfterCommit returns what will be the lowest starting index
+// of among active transactions after the given transaction has been committed
+// (or rolled-back).
+func (t *fsmTxnCommitIndexTracker) lowestActiveIndexAfterCommit(transactionStartIndex uint64) uint64 {
+	t.l.Lock()
+	defer t.l.Unlock()
+
+	lowestActiveIndex := uint64(math.MaxUint64)
+	for index, activeCount := range t.sourceIndexMap {
+		if index == transactionStartIndex && activeCount == 1 { // ignore given transaction, iff it is the only transaction at this index
+			continue
+		}
+		lowestActiveIndex = min(lowestActiveIndex, index)
+	}
+	return lowestActiveIndex
+}
+
+func (t *fsmTxnCommitIndexTracker) clearOldEntries(lowestActiveIndex uint64) {
+	t.l.Lock()
+	defer t.l.Unlock()
+
+	maps.DeleteFunc(t.indexModifiedMap, func(key uint64, _ map[string]struct{}) bool {
+		return key < lowestActiveIndex
+	})
+}
+
 func (t *fsmTxnCommitIndexTracker) trackTransaction(index uint64) {
 	t.l.Lock()
 	defer t.l.Unlock()
@@ -806,33 +870,6 @@ func (t *fsmTxnCommitIndexTracker) completeTransaction(index uint64) {
 		t.sourceIndexMap[index] -= 1
 	} else {
 		delete(t.sourceIndexMap, index)
-	}
-
-	if existing == 1 {
-		// See if we invalidated the smallest entry; if so, find the next
-		// smallest entry and invalidate all earlier indexModifiedMap
-		// entries as a result.
-		minIndex := index
-		for key := range t.sourceIndexMap {
-			if key < minIndex {
-				minIndex = key
-			}
-		}
-
-		if minIndex < index {
-			return
-		}
-
-		deletedIndices := make([]uint64, 0, physical.DefaultParallelTransactions/2)
-		for key := range t.indexModifiedMap {
-			if key <= minIndex {
-				deletedIndices = append(deletedIndices, key)
-			}
-		}
-
-		for _, index := range deletedIndices {
-			delete(t.indexModifiedMap, index)
-		}
 	}
 }
 
@@ -1043,7 +1080,7 @@ func (s *fsmTxnCommitIndexApplicationState) doVerifyList(tx *bolt.Tx, b *bolt.Bu
 	metrics.IncrCounter([]string{"raft-storage", "txn_fast_apply_miss"}, 1)
 
 	var keys []string
-	keys, err = listPageInner(context.Background(), tx, params.Prefix, params.After, params.Limit)
+	keys, err = listPageInner(context.Background(), b, params.Prefix, params.After, params.Limit)
 	if err == nil {
 		err = doVerifyList(op.Key, keys, op.Value)
 	}

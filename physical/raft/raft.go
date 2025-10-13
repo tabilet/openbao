@@ -33,6 +33,7 @@ import (
 	wrapping "github.com/openbao/go-kms-wrapping/v2"
 	"github.com/openbao/openbao/api/v2"
 	"github.com/openbao/openbao/helper/metricsutil"
+	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
@@ -203,6 +204,8 @@ type RaftBackend struct {
 
 	effectiveSDKVersion string
 	failGetInTxn        *uint32
+
+	mEnabled bool
 }
 
 // LeaderJoinInfo contains information required by a node to join itself as a
@@ -382,7 +385,7 @@ func NewRaftBackend(conf map[string]string, logger log.Logger) (physical.Backend
 	}
 
 	// Create the FSM.
-	fsm, err := NewFSM(path, localID, logger.Named("fsm"))
+	fsm, err := NewFSM(path, localID, strings.ToLower(conf["m_enabled"]) == "true", logger.Named("fsm"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create fsm: %v", err)
 	}
@@ -420,8 +423,9 @@ func NewRaftBackend(conf map[string]string, logger log.Logger) (physical.Backend
 		dbPath := filepath.Join(path, "raft.db")
 		opts := boltOptions(dbPath)
 		raftOptions := raftboltdb.Options{
-			Path:        dbPath,
-			BoltOptions: opts,
+			Path:                    dbPath,
+			BoltOptions:             opts,
+			MsgpackUseNewTimeFormat: true,
 		}
 		store, err := raftboltdb.New(raftOptions)
 		if err != nil {
@@ -549,6 +553,7 @@ func NewRaftBackend(conf map[string]string, logger log.Logger) (physical.Backend
 		nonVoter:                   nonVoter,
 		upgradeVersion:             upgradeVersion,
 		failGetInTxn:               new(uint32),
+		mEnabled:                   strings.ToLower(conf["m_enabled"]) == "true",
 	}, nil
 }
 
@@ -1603,7 +1608,13 @@ func (b *RaftBackend) Delete(ctx context.Context, path string) error {
 		return err
 	}
 
+	bucketName, err := b.getBucketnameString(ctx)
+	if err != nil {
+		return err
+	}
+
 	command := &LogData{
+		BucketName: &bucketName,
 		Operations: []*LogOperation{
 			{
 				OpType: deleteOp,
@@ -1615,7 +1626,7 @@ func (b *RaftBackend) Delete(ctx context.Context, path string) error {
 	defer b.permitPool.Release()
 
 	b.l.RLock()
-	err := b.applyLog(ctx, command)
+	err = b.applyLog(ctx, command)
 	b.l.RUnlock()
 	return err
 }
@@ -1663,7 +1674,13 @@ func (b *RaftBackend) Put(ctx context.Context, entry *physical.Entry) error {
 		return err
 	}
 
+	bucketName, err := b.getBucketnameString(ctx)
+	if err != nil {
+		return err
+	}
+
 	command := &LogData{
+		BucketName: &bucketName,
 		Operations: []*LogOperation{
 			{
 				OpType: putOp,
@@ -1677,7 +1694,7 @@ func (b *RaftBackend) Put(ctx context.Context, entry *physical.Entry) error {
 	defer b.permitPool.Release()
 
 	b.l.RLock()
-	err := b.applyLog(ctx, command)
+	err = b.applyLog(ctx, command)
 	b.l.RUnlock()
 	return err
 }
@@ -1862,6 +1879,76 @@ func (b *RaftBackend) BeginReadOnlyTx(ctx context.Context) (physical.Transaction
 
 func (b *RaftBackend) BeginTx(ctx context.Context) (physical.Transaction, error) {
 	return b.newTransaction(ctx, true)
+}
+
+// getBucketname returns the quoted table name for the current context.
+func getBucketname(ctx context.Context) ([]byte, error) {
+	ns, err := namespace.FromContext(ctx)
+	if err != nil && err == namespace.ErrNoNamespace {
+		return dataBucketName, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("namespace in ctx error: %w", err)
+	}
+
+	if ns.Path == "" {
+		return dataBucketName, nil
+	}
+	return []byte(ns.UUID), nil
+}
+
+func (b *RaftBackend) getBucketname(ctx context.Context) ([]byte, error) {
+	if !b.mEnabled {
+		return dataBucketName, nil
+	}
+
+	return getBucketname(ctx)
+}
+
+func (b *RaftBackend) getBucketnameString(ctx context.Context) (string, error) {
+	bs, err := b.getBucketname(ctx)
+	if err != nil {
+		return "", err
+	}
+	return string(bs), nil
+}
+
+// CreateIfNotExists creates the table if it does not exist.
+func (b *RaftBackend) CreateIfNotExists(ctx context.Context, path, uuid string) error {
+	if !b.mEnabled {
+		return nil
+	}
+
+	parent, err := b.getBucketname(ctx)
+	if err != nil {
+		return err
+	}
+	db := b.fsm.getDB()
+	return db.Update(func(tx *bolt.Tx) error {
+		if tx.Bucket([]byte(parent)) == nil {
+			return fmt.Errorf("parent %s does not exist", parent)
+		}
+		_, err := tx.CreateBucketIfNotExists([]byte(uuid))
+		return err
+	})
+}
+
+// DropIfExists drop the table if it exists.
+func (b *RaftBackend) DropIfExists(ctx context.Context, path, uuid string) error {
+	if !b.mEnabled {
+		return nil
+	}
+
+	parent, err := b.getBucketname(ctx)
+	if err != nil {
+		return err
+	}
+	db := b.fsm.getDB()
+	return db.Update(func(tx *bolt.Tx) error {
+		if tx.Bucket([]byte(parent)) == nil {
+			return fmt.Errorf("parent %s does not exist", parent)
+		}
+		return tx.DeleteBucket([]byte(uuid))
+	})
 }
 
 // RaftLock implements the physical Lock interface and enables HA for this

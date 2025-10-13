@@ -275,6 +275,9 @@ func (c *Core) teardownNamespaceStore() error {
 	return nil
 }
 
+// invalidate will be used in the future for implementing read replica nodes
+//
+//nolint:unused
 func (ns *NamespaceStore) invalidate(ctx context.Context, path string) error {
 	// We want to keep invalidation proper fast (as it holds up replication),
 	// so defer invalidation to the next load.
@@ -381,13 +384,10 @@ func (ns *NamespaceStore) setNamespaceLocked(ctx context.Context, nsEntry *names
 
 	if err := ns.writeNamespace(ctx, entry); err != nil {
 		return fmt.Errorf("failed to persist namespace: %w", err)
-		// oss start
-		// Create the necessary mountable table for the new namespace.
-	} else if ma, ok := ns.core.GetMountable(); ok {
-		if err := ma.CreateIfNotExists(ctx, entry.Path); err != nil {
+	} else if ma, ok := ns.core.GetMountable(); ok { // PNPT: create mountable table for the new namespace.
+		if err := ma.CreateIfNotExists(ctx, entry.Path, entry.UUID); err != nil {
 			return fmt.Errorf("failed to create mountable for namespace: %w", err)
 		}
-		// oss end
 	}
 
 	ns.namespacesByPath.Insert(entry)
@@ -785,24 +785,19 @@ func (ns *NamespaceStore) DeleteNamespace(ctx context.Context, path string) (str
 		delete(ns.namespacesByUUID, namespaceToDelete.UUID)
 		delete(ns.namespacesByAccessor, namespaceToDelete.ID)
 
-		// oss start
-		// drop the empty table for the deleted namespace
+		// PNPT: drop the empty table for the deleted namespace
 		if ma, ok := ns.core.GetMountable(); ok {
-			err = ma.DropIfExists(ctx, namespaceToDelete.Path)
+			err = ma.DropIfExists(ctx, namespaceToDelete.Path, namespaceToDelete.UUID)
 			if err != nil {
 				ns.logger.Error("failed to drop namespace from mountable", "namespace", namespaceToDelete.Path, "error", err.Error())
 			}
 		}
-		// oss end
 
 		view := NamespaceView(ns.storage, parent).SubView(namespaceStoreSubPath)
 		err = logical.WithTransaction(ctx, view, func(s logical.Storage) error {
-			// oss start
-			// using parent context is consistent with parent in writeNamespace
-			// return s.Delete(ctx, namespaceToDelete.UUID)
+			// PNPT: using parent context is consistent with that in writeNamespace
 			parentCtx := namespace.ContextWithNamespace(ctx, parent)
 			return s.Delete(parentCtx, namespaceToDelete.UUID)
-			// oss end
 		})
 		if err != nil {
 			ns.logger.Error("failed to delete namespace storage", "namespace", namespaceToDelete.Path, "error", err.Error())
@@ -1049,10 +1044,7 @@ func (ns *NamespaceStore) LockNamespace(ctx context.Context, path string) (strin
 	return lockKey, nil
 }
 
-// oss start
-// GetMountable returns the mountable representation of the underlying physical storage.
+// GetMountable returns the mountable representing the underlying physical storage.
 func (c *Core) GetMountable() (physical.Mountable, bool) {
 	return physical.PhysicalToMountable(c.underlyingPhysical)
 }
-
-// oss end

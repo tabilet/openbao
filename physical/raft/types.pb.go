@@ -97,8 +97,12 @@ func (x *LogOperation) GetValue() []byte {
 }
 
 type LogData struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Operations    []*LogOperation        `protobuf:"bytes,1,rep,name=operations,proto3" json:"operations,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Operations []*LogOperation        `protobuf:"bytes,1,rep,name=operations,proto3" json:"operations,omitempty"`
+	// LowestActiveIndex is optional, the start index of the oldest (therefore lowest) active transaction
+	LowestActiveIndex *uint64 `protobuf:"varint,2,opt,name=lowest_active_index,json=lowestActiveIndex,proto3,oneof" json:"lowest_active_index,omitempty"`
+	// BucketName is the bucket for data
+	BucketName    *string `protobuf:"bytes,3,opt,name=bucket_name,json=bucketName,proto3,oneof" json:"bucket_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -138,6 +142,20 @@ func (x *LogData) GetOperations() []*LogOperation {
 		return x.Operations
 	}
 	return nil
+}
+
+func (x *LogData) GetLowestActiveIndex() uint64 {
+	if x != nil && x.LowestActiveIndex != nil {
+		return *x.LowestActiveIndex
+	}
+	return 0
+}
+
+func (x *LogData) GetBucketName() string {
+	if x != nil && x.BucketName != nil {
+		return *x.BucketName
+	}
+	return ""
 }
 
 type IndexValue struct {
@@ -357,11 +375,16 @@ const file_physical_raft_types_proto_rawDesc = "" +
 	"\aop_type\x18\x01 \x01(\rR\x06opType\x12\x14\n" +
 	"\x05flags\x18\x02 \x01(\x04R\x05flags\x12\x10\n" +
 	"\x03key\x18\x03 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x04 \x01(\fR\x05value\"=\n" +
+	"\x05value\x18\x04 \x01(\fR\x05value\"\xc0\x01\n" +
 	"\aLogData\x122\n" +
 	"\n" +
 	"operations\x18\x01 \x03(\v2\x12.raft.LogOperationR\n" +
-	"operations\"6\n" +
+	"operations\x123\n" +
+	"\x13lowest_active_index\x18\x02 \x01(\x04H\x00R\x11lowestActiveIndex\x88\x01\x01\x12$\n" +
+	"\vbucket_name\x18\x03 \x01(\tH\x01R\n" +
+	"bucketName\x88\x01\x01B\x16\n" +
+	"\x14_lowest_active_indexB\x0e\n" +
+	"\f_bucket_name\"6\n" +
 	"\n" +
 	"IndexValue\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x14\n" +
@@ -412,6 +435,7 @@ func file_physical_raft_types_proto_init() {
 	if File_physical_raft_types_proto != nil {
 		return
 	}
+	file_physical_raft_types_proto_msgTypes[1].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

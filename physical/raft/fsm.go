@@ -136,10 +136,12 @@ type FSM struct {
 
 	// tracker for fast application of transactions
 	fastTxnTracker *fsmTxnCommitIndexTracker
+
+	mEnabled bool
 }
 
 // NewFSM constructs a FSM using the given directory
-func NewFSM(path string, localID string, logger log.Logger) (*FSM, error) {
+func NewFSM(path string, localID string, mEnabled bool, logger log.Logger) (*FSM, error) {
 	// Initialize the latest term, index, and config values
 	latestTerm := new(uint64)
 	latestIndex := new(uint64)
@@ -161,6 +163,8 @@ func NewFSM(path string, localID string, logger log.Logger) (*FSM, error) {
 		desiredSuffrage: "voter",
 		localID:         localID,
 		fastTxnTracker:  FsmTxnCommitIndexTracker(),
+
+		mEnabled: mEnabled,
 	}
 
 	f.chunker = raftchunking.NewChunkingBatchingFSM(f, &FSMChunkStorage{
@@ -176,6 +180,22 @@ func NewFSM(path string, localID string, logger log.Logger) (*FSM, error) {
 	}
 
 	return f, nil
+}
+
+func (f *FSM) getBucketname(ctx context.Context) ([]byte, error) {
+	if !f.mEnabled || ctx == nil {
+		return dataBucketName, nil
+	}
+
+	return getBucketname(ctx)
+}
+
+func (f *FSM) getBucketnameString(ctx context.Context) (string, error) {
+	name, err := f.getBucketname(ctx)
+	if err != nil {
+		return "", err
+	}
+	return string(name), nil
 }
 
 func (f *FSM) getDB() *bolt.DB {
@@ -476,7 +496,11 @@ func (f *FSM) Delete(ctx context.Context, path string) error {
 	defer f.l.RUnlock()
 
 	return f.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(dataBucketName).Delete([]byte(path))
+		bucketName, err := f.getBucketname(ctx)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(bucketName).Delete([]byte(path))
 	})
 }
 
@@ -489,7 +513,11 @@ func (f *FSM) DeletePrefix(ctx context.Context, prefix string) error {
 
 	err := f.db.Update(func(tx *bolt.Tx) error {
 		// Assume bucket exists and has keys
-		c := tx.Bucket(dataBucketName).Cursor()
+		bucketName, err := f.getBucketname(ctx)
+		if err != nil {
+			return err
+		}
+		c := tx.Bucket(bucketName).Cursor()
 
 		prefixBytes := []byte(prefix)
 		for k, _ := c.Seek(prefixBytes); k != nil && bytes.HasPrefix(k, prefixBytes); k, _ = c.Next() {
@@ -517,7 +545,11 @@ func (f *FSM) Get(ctx context.Context, path string) (*physical.Entry, error) {
 	var found bool
 
 	err := f.db.View(func(tx *bolt.Tx) error {
-		value := tx.Bucket(dataBucketName).Get([]byte(path))
+		bucketName, err := f.getBucketname(ctx)
+		if err != nil {
+			return err
+		}
+		value := tx.Bucket(bucketName).Get([]byte(path))
 		if value != nil {
 			found = true
 			valCopy = make([]byte, len(value))
@@ -548,7 +580,11 @@ func (f *FSM) Put(ctx context.Context, entry *physical.Entry) error {
 
 	// Start a write transaction.
 	return f.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(dataBucketName).Put([]byte(entry.Key), entry.Value)
+		bucketName, err := f.getBucketname(ctx)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(bucketName).Put([]byte(entry.Key), entry.Value)
 	})
 }
 
@@ -571,7 +607,11 @@ func (f *FSM) ListPage(ctx context.Context, prefix string, after string, limit i
 	var err error
 	var keys []string
 	err = f.db.View(func(tx *bolt.Tx) error {
-		keys, err = listPageInner(ctx, tx, prefix, after, limit)
+		bucketName, err := f.getBucketname(ctx)
+		if err != nil {
+			return err
+		}
+		keys, err = listPageInner(ctx, tx.Bucket(bucketName), prefix, after, limit)
 		if err != nil {
 			return err
 		}
@@ -582,7 +622,7 @@ func (f *FSM) ListPage(ctx context.Context, prefix string, after string, limit i
 	return keys, err
 }
 
-func listPageInner(ctx context.Context, tx *bolt.Tx, prefix string, after string, limit int) ([]string, error) {
+func listPageInner(ctx context.Context, b *bolt.Bucket, prefix string, after string, limit int) ([]string, error) {
 	var keys []string
 
 	prefixBytes := []byte(prefix)
@@ -598,7 +638,7 @@ func listPageInner(ctx context.Context, tx *bolt.Tx, prefix string, after string
 	}
 
 	// Assume bucket exists and has keys
-	c := tx.Bucket(dataBucketName).Cursor()
+	c := b.Cursor()
 
 	// By seeking relative to the after location, we can save looking
 	// at unnecessary entries before our expected entry.
@@ -821,6 +861,8 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		f.applyCallback()
 	}
 
+	var lowestActiveIndex *uint64
+
 	// One would think that this f.db.Update(...) and the following loop over
 	// commands should be in the opposite order, as we want transactions to be
 	// applied atomically. Indeed, 2c154ad516162dcb8b15ad270cd6a15516f2ce59 had
@@ -836,8 +878,6 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	// application and switch to pre-verifying transactions prior to
 	// performing any writes in them.
 	err = f.db.Update(func(tx *bolt.Tx) error {
-		var err error
-		b := tx.Bucket(dataBucketName)
 		configB := tx.Bucket(configBucketName)
 		latestIndex := atomic.LoadUint64(f.latestIndex)
 
@@ -848,10 +888,19 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			case *LogData:
 				txnState := f.fastTxnTracker.applyState(latestIndex, commandIndex, logs[commandIndex].Index)
 
+				bucketName := dataBucketName
+				if command.BucketName != nil {
+					bucketName = []byte(*command.BucketName)
+				}
+				b := tx.Bucket(bucketName)
 				if len(command.Operations) == 0 || command.Operations[0].OpType != beginTxOp {
 					err = f.applyBatchNonTxOps(b, txnState, command)
 				} else {
 					err = f.applyBatchTxOps(tx, b, txnState, command)
+				}
+
+				if command.LowestActiveIndex != nil {
+					lowestActiveIndex = command.LowestActiveIndex
 				}
 
 				if err != nil {
@@ -913,6 +962,10 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		panic("failed to store data")
 	}
 
+	if lowestActiveIndex != nil {
+		f.fastTxnTracker.clearOldEntries(*lowestActiveIndex)
+	}
+
 	// If we advanced the latest value, update the in-memory representation too.
 	if len(logIndex) > 0 {
 		atomic.StoreUint64(f.latestTerm, lastLog.Term)
@@ -963,7 +1016,11 @@ func (f *FSM) writeTo(ctx context.Context, metaSink writeErrorCloser, sink write
 	defer f.l.RUnlock()
 
 	err := f.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(dataBucketName)
+		bucketName, err := f.getBucketname(ctx)
+		if err != nil {
+			return err
+		}
+		b := tx.Bucket(bucketName)
 
 		c := b.Cursor()
 
@@ -1172,12 +1229,16 @@ func (f *FSMChunkStorage) StoreChunk(chunk *raftchunking.ChunkInfo) (bool, error
 	// Start a write transaction.
 	done := new(bool)
 	if err := f.f.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket(dataBucketName).Put([]byte(entry.Key), entry.Value); err != nil {
+		bucketName, err := f.f.getBucketname(f.ctx)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket(bucketName).Put([]byte(entry.Key), entry.Value); err != nil {
 			return fmt.Errorf("error storing chunk info: %w", err)
 		}
 
 		// Assume bucket exists and has keys
-		c := tx.Bucket(dataBucketName).Cursor()
+		c := tx.Bucket(bucketName).Cursor()
 
 		var keys []string
 		prefixBytes := []byte(prefix)
