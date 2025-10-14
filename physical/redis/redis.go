@@ -94,13 +94,6 @@ func NewRedisBackend(conf map[string]string, logger hclog.Logger) (*RedisBackend
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
-	/*
-		tname, err := tableFromContext(ctx)
-		if err != nil {
-			return nil, err
-		}
-		err = redis.Do(ctx, radix.Cmd(nil, "SET", tname+delimeter, ""))
-	*/
 
 	if logger == nil {
 		logger = hclog.Default()
@@ -121,24 +114,6 @@ func quote(s string) string {
 	return strings.ReplaceAll(s, `;`, ``)
 }
 
-func tworeplace(s string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(s, "-", ""), "/", delimeter)
-}
-
-// tableFromNamespace returns the table name for the current namespace.
-func tableFromNamespace(ns string) (string, error) {
-	path := namespace.RootNamespaceID
-	if ns != "" {
-		if strings.Contains(ns, delimeter) {
-			return "", fmt.Errorf("invalid namespace path %s", ns)
-		}
-		path += delimeter + strings.Trim(ns, "/")
-		path = tworeplace(path)
-	}
-
-	return quote(path), nil
-}
-
 // tableFromContext returns table name without database name, from context.
 func tableFromContext(ctx context.Context) (string, error) {
 	ns, err := namespace.FromContext(ctx)
@@ -148,7 +123,10 @@ func tableFromContext(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("namespace in ctx error: %w", err)
 	}
 
-	return tableFromNamespace(ns.Path)
+	if ns.Path == "" || ns.UUID == namespace.RootNamespaceUUID {
+		return namespace.RootNamespaceID, nil
+	}
+	return quote(ns.UUID), nil
 }
 
 func (m *RedisBackend) existing(ctx context.Context, statement string) (bool, error) {
@@ -158,7 +136,7 @@ func (m *RedisBackend) existing(ctx context.Context, statement string) (bool, er
 }
 
 // CreateIfNotExists creates the table if it does not exist.
-func (m *RedisBackend) CreateIfNotExists(ctx context.Context, path string) error {
+func (m *RedisBackend) CreateIfNotExists(ctx context.Context, path, uuid string) error {
 	defer metrics.MeasureSince([]string{"redis", "create if not exists"}, time.Now())
 
 	parent, err := tableFromContext(ctx)
@@ -174,27 +152,17 @@ func (m *RedisBackend) CreateIfNotExists(ctx context.Context, path string) error
 		return fmt.Errorf("parent namespace not found")
 	}
 
-	tname, err := tableFromNamespace(path)
-	if err != nil {
-		m.logger.Error("get table name", "path", path, "error", err)
-		return err
-	}
-
-	m.logger.Debug("redis table is ready to be created", "table", tname)
+	m.logger.Debug("redis table is ready to be created", "table", uuid)
 	return nil
 }
 
 // DropIfExists drop the table if it exists.
-func (m *RedisBackend) DropIfExists(ctx context.Context, path string) error {
+func (m *RedisBackend) DropIfExists(ctx context.Context, path, uuid string) error {
 	defer metrics.MeasureSince([]string{"redis", "drop if exists"}, time.Now())
 
-	tname, err := tableFromNamespace(path)
-	if err != nil {
-		m.logger.Error("get table name", "path", path, "error", err)
-		return err
-	}
+	tname := quote(uuid)
 
-	err = m.client.Do(ctx, radix.Cmd(nil, "DEL", tname))
+	err := m.client.Do(ctx, radix.Cmd(nil, "DEL", tname))
 	if err != nil {
 		m.logger.Error("drop table", "table", tname, "error", err)
 		return fmt.Errorf("drop table %s: %w", tname, err)

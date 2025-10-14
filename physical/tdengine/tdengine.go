@@ -21,7 +21,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	metrics "github.com/armon/go-metrics"
@@ -48,9 +47,6 @@ type TDEngineBackend struct {
 	logger     hclog.Logger
 	permitPool *physical.PermitPool
 	conf       map[string]string
-
-	updateLock sync.Mutex
-	mountLock  sync.RWMutex
 }
 
 func NewTDEnginePhysicalBackend(conf map[string]string, logger hclog.Logger) (physical.Backend, error) {
@@ -61,7 +57,7 @@ func NewTDEnginePhysicalBackend(conf map[string]string, logger hclog.Logger) (ph
 // server address and credential for accessing tdengine database.
 func NewTDEngineBackend(conf map[string]string, logger hclog.Logger) (*TDEngineBackend, error) {
 	connURL := api.ReadBaoVariable("TDE_CONNECTION_URL")
-	if v, ok := conf["connection_url"]; ok {
+	if v, ok := conf["connection_url"]; ok { // timezone like UTC is strongly recommended
 		connURL = v
 	}
 	if connURL == "" {
@@ -73,7 +69,7 @@ func NewTDEngineBackend(conf map[string]string, logger hclog.Logger) (*TDEngineB
 		database = v
 	}
 	if database == "" {
-		return nil, fmt.Errorf("missing database parameter")
+		database = "openbao"
 	}
 
 	db, err := sql.Open("taosSql", connURL)
@@ -166,60 +162,40 @@ func NewTDEngineBackend(conf map[string]string, logger hclog.Logger) (*TDEngineB
 	return m, nil
 }
 
+// quote replaces '-' with '_' and adds 'x' prefix to make a valid TDengine table name.
 func quote(s string) string {
-	return strings.ReplaceAll(s, `;`, ``)
+	return "x" + strings.ReplaceAll(s, `-`, `_`)
 }
 
-// tablename returns the table name for the current namespace.
-func tablename(ns *namespace.Namespace, change ...string) string {
-	path := ns.Path
-	if path == "" {
-		path = namespace.RootNamespaceID
-	} else {
-		path = strings.Trim(path, "/")
-	}
-	x := strings.ReplaceAll(strings.ReplaceAll(path, "-", ""), "/", "_")
-	if len(change) > 0 {
-		x = change[0] + "_" + x
-	}
-	return quote(x)
-}
+// Unquote removes 'x' prefix and replaces '_' with '-' to get original UUID string.
+// func unquote(s string) string {
+//	return strings.ReplaceAll(strings.TrimPrefix(s, "x"), `_`, `-`)
+//}
 
 // getTablename returns table name without database name, from context.
-func getTablename(ctx context.Context, change ...string) (string, error) {
+func getTablename(ctx context.Context) (string, error) {
 	ns, err := namespace.FromContext(ctx)
 	if err != nil && err == namespace.ErrNoNamespace {
-		root := namespace.RootNamespaceID
-		if len(change) > 0 {
-			root = change[0]
-		}
-		return root, nil
+		return namespace.RootNamespaceID, nil
 	} else if err != nil {
 		return "", fmt.Errorf("namespace in ctx error: %w", err)
 	}
 
-	return tablename(ns, change...), nil
+	if ns.Path == "" || ns.UUID == namespace.RootNamespaceUUID {
+		return namespace.RootNamespaceID, nil
+	}
+
+	return quote(ns.UUID), nil
 }
 
 // m.getTablename returns table name from context.
-func (m *TDEngineBackend) getTablename(ctx context.Context, change ...string) (string, error) {
-	name, err := getTablename(ctx, change...)
+func (m *TDEngineBackend) getTablename(ctx context.Context) (string, error) {
+	name, err := getTablename(ctx)
 	if err != nil {
 		return "", err
 	}
 
 	return m.database + `.` + name, nil
-}
-
-// getChildName returns table name, id and path from namespace
-func getChildName(path string) (string, error) {
-	tname := strings.Trim(path, "/")
-	if strings.Contains(tname, "_") {
-		return "", fmt.Errorf("invalid namespace path %s", tname)
-	}
-
-	tname = strings.ReplaceAll(strings.ReplaceAll(tname, "-", ""), "/", "_")
-	return tname, nil
 }
 
 func (m *TDEngineBackend) existingChildren(tname string) (bool, error) {
@@ -247,7 +223,7 @@ func (m *TDEngineBackend) existing(statement string) (bool, error) {
 }
 
 // CreateIfNotExists creates the table if it does not exist.
-func (m *TDEngineBackend) CreateIfNotExists(ctx context.Context, path string) error {
+func (m *TDEngineBackend) CreateIfNotExists(ctx context.Context, path, uuid string) error {
 	defer metrics.MeasureSince([]string{"tdengine", "create if not exists"}, time.Now())
 
 	parent, err := getTablename(ctx)
@@ -263,10 +239,7 @@ func (m *TDEngineBackend) CreateIfNotExists(ctx context.Context, path string) er
 		return fmt.Errorf("parent namespace not found")
 	}
 
-	tname, err := getChildName(path)
-	if err != nil {
-		return err
-	}
+	tname := quote(uuid)
 
 	// Create the table if it does not exist.
 	item := m.stable
@@ -282,13 +255,10 @@ func (m *TDEngineBackend) CreateIfNotExists(ctx context.Context, path string) er
 }
 
 // DropIfExists drop the table if it exists.
-func (m *TDEngineBackend) DropIfExists(ctx context.Context, path string) error {
+func (m *TDEngineBackend) DropIfExists(ctx context.Context, path, uuid string) error {
 	defer metrics.MeasureSince([]string{"tdengine", "drop if exists"}, time.Now())
 
-	tname, err := getChildName(path)
-	if err != nil {
-		return err
-	}
+	tname := quote(uuid)
 
 	tableExist, err := m.existingTable(tname)
 	if err != nil {
