@@ -34,6 +34,7 @@ import (
 	"github.com/openbao/openbao/api/v2"
 	"github.com/openbao/openbao/helper/metricsutil"
 	"github.com/openbao/openbao/helper/namespace"
+	"github.com/openbao/openbao/helper/tlsdebug"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
@@ -291,7 +292,7 @@ func (b *RaftBackend) JoinConfig() ([]*LeaderJoinInfo, error) {
 		}
 
 		info.Retry = true
-		info.TLSConfig, err = parseTLSInfo(info)
+		info.TLSConfig, err = b.parseTLSInfo(info)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create tls config to communicate with leader node (retry_join index: %d): %w", i, err)
 		}
@@ -302,7 +303,7 @@ func (b *RaftBackend) JoinConfig() ([]*LeaderJoinInfo, error) {
 
 // parseTLSInfo is a helper for parses the TLS information, preferring file
 // paths over raw certificate content.
-func parseTLSInfo(leaderInfo *LeaderJoinInfo) (*tls.Config, error) {
+func (b *RaftBackend) parseTLSInfo(leaderInfo *LeaderJoinInfo) (*tls.Config, error) {
 	var tlsConfig *tls.Config
 	var err error
 	if len(leaderInfo.LeaderCACertFile) != 0 || len(leaderInfo.LeaderClientCertFile) != 0 || len(leaderInfo.LeaderClientKeyFile) != 0 {
@@ -320,7 +321,7 @@ func parseTLSInfo(leaderInfo *LeaderJoinInfo) (*tls.Config, error) {
 		tlsConfig.ServerName = leaderInfo.LeaderTLSServerName
 	}
 
-	return tlsConfig, nil
+	return tlsdebug.Inject(b.logger, tlsConfig), nil
 }
 
 // EnsurePath is used to make sure a path exists
@@ -916,8 +917,8 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 	}
 
 	listenerIsNil := func(cl cluster.ClusterHook) bool {
-		switch {
-		case opts.ClusterListener == nil:
+		switch opts.ClusterListener {
+		case nil:
 			return true
 		default:
 			// Concrete type checks
@@ -1041,11 +1042,7 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 		// for - select pattern.
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
-		for {
-			if raftObj.State() == raft.Leader {
-				break
-			}
-
+		for raftObj.State() != raft.Leader {
 			ticker.Reset(10 * time.Millisecond)
 			select {
 			case <-ctx.Done():
