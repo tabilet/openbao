@@ -253,8 +253,20 @@ func TestRaft_Snapshot_Peers(t *testing.T) {
 
 	ensureCommitApplied(t, commitIdx, raft2)
 
+	db1, err := raft1.fsm.getDB(databaseFilename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+
+	db2, err := raft2.fsm.getDB(databaseFilename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
 	// Make sure the snapshot was applied correctly on the follower
-	if err := compareDBs(t, raft1.fsm.getDB(), raft2.fsm.getDB(), false); err != nil {
+	if err := compareDBs(t, db1, db2, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -585,7 +597,7 @@ func TestBoltSnapshotStore_Listing(t *testing.T) {
 		Level: hclog.Trace,
 	})
 
-	fsm, err := NewFSM(parent, "", false, logger)
+	fsm, err := NewFSM(parent, "", false, -1, -1, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -650,7 +662,7 @@ func TestBoltSnapshotStore_CreateInstallSnapshot(t *testing.T) {
 		Level: hclog.Trace,
 	})
 
-	fsm, err := NewFSM(parent, "", false, logger)
+	fsm, err := NewFSM(parent, "", false, -1, -1, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -748,18 +760,31 @@ func TestBoltSnapshotStore_CreateInstallSnapshot(t *testing.T) {
 		t.Fatal("expected snapshot installer object")
 	}
 
-	newFSM, err := NewFSM(filepath.Dir(installer.Filename()), "", false, logger)
+	newFSM, err := NewFSM(filepath.Dir(installer.Filename()), "", false, -1, -1, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = compareDBs(t, fsm.getDB(), newFSM.getDB(), true)
+	db1, err := fsm.getDB(databaseFilename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+
+	db2, err := newFSM.getDB(databaseFilename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	// Make sure data is the same
+	err = compareDBs(t, db1, db2, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Make sure config data is different
-	err = compareDBs(t, fsm.getDB(), newFSM.getDB(), false)
+	err = compareDBs(t, db1, db2, false)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -807,7 +832,7 @@ func TestBoltSnapshotStore_CreateInstallSnapshot(t *testing.T) {
 
 		// Close/Reopen the db and make sure we still match
 		fsm.Close()
-		fsm, err = NewFSM(parent, "", false, logger)
+		fsm, err = NewFSM(parent, "", false, -1, -1, logger)
 		if err != nil {
 			t.Fatal(err)
 		}

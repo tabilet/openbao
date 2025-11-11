@@ -29,6 +29,7 @@ import (
 	"github.com/openbao/openbao/sdk/v2/plugin/pb"
 	bolt "go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
+	"zgo.at/zcache/v2"
 )
 
 const (
@@ -123,7 +124,8 @@ type FSM struct {
 	// applyCallback is used to control the pace of applies in tests
 	applyCallback func()
 
-	db *bolt.DB
+	dbCache *zcache.Cache[string, *bolt.DB]
+	//db *bolt.DB
 
 	// retoreCb is called after we've restored a snapshot
 	restoreCb restoreCallback
@@ -141,7 +143,7 @@ type FSM struct {
 }
 
 // NewFSM constructs a FSM using the given directory
-func NewFSM(path string, localID string, mEnabled bool, logger log.Logger) (*FSM, error) {
+func NewFSM(path string, localID string, mEnabled bool, expire, cleanup time.Duration, logger log.Logger) (*FSM, error) {
 	// Initialize the latest term, index, and config values
 	latestTerm := new(uint64)
 	latestIndex := new(uint64)
@@ -172,14 +174,10 @@ func NewFSM(path string, localID string, mEnabled bool, logger log.Logger) (*FSM
 		ctx: context.Background(),
 	})
 
-	dbPath := filepath.Join(path, databaseFilename)
-	f.l.Lock()
-	defer f.l.Unlock()
-	if err := f.openDBFile(dbPath); err != nil {
-		return nil, fmt.Errorf("failed to open bolt file: %w", err)
-	}
+	f.dbCache = zcache.New[string, *bolt.DB](expire, cleanup)
+	_, err := f.getDB(databaseFilename)
 
-	return f, nil
+	return f, err
 }
 
 func (f *FSM) getBucketname(ctx context.Context) ([]byte, error) {
@@ -198,11 +196,27 @@ func (f *FSM) getBucketnameString(ctx context.Context) (string, error) {
 	return string(name), nil
 }
 
-func (f *FSM) getDB() *bolt.DB {
+func (f *FSM) getDB(filename string) (*bolt.DB, error) {
 	f.l.RLock()
 	defer f.l.RUnlock()
 
-	return f.db
+	db, ok := f.dbCache.Get(filename)
+	if ok {
+		return db, nil
+	}
+
+	f.l.Lock()
+	defer f.l.Unlock()
+
+	db, err := f.openDBFile(filename)
+	if err == nil {
+		if filename == databaseFilename {
+			f.dbCache.SetWithExpire(filename, db, zcache.NoExpiration)
+		} else {
+			f.dbCache.Set(filename, db)
+		}
+	}
+	return db, err
 }
 
 // SetFSMDelay adds a delay to the FSM apply. This is used in tests to simulate
@@ -217,16 +231,17 @@ func (r *RaftBackend) SetFSMApplyCallback(f func()) {
 	r.fsm.l.Unlock()
 }
 
-func (f *FSM) openDBFile(dbPath string) error {
-	if len(dbPath) == 0 {
-		return errors.New("can not open empty filename")
+func (f *FSM) openDBFile(filename string) (*bolt.DB, error) {
+	if len(filename) == 0 {
+		return nil, errors.New("can not open empty filename")
 	}
+	dbPath := filepath.Join(f.path, filename)
 
 	st, err := os.Stat(dbPath)
 	switch {
 	case err != nil && os.IsNotExist(err):
 	case err != nil:
-		return fmt.Errorf("error checking raft FSM db file %q: %v", dbPath, err)
+		return nil, fmt.Errorf("error checking raft FSM db file %q: %v", dbPath, err)
 	default:
 		perms := st.Mode() & os.ModePerm
 		if perms&0o077 != 0 {
@@ -239,7 +254,7 @@ func (f *FSM) openDBFile(dbPath string) error {
 	start := time.Now()
 	boltDB, err := bolt.Open(dbPath, 0o600, opts)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	elapsed := time.Since(start)
 	f.logger.Debug("time to open database", "elapsed", elapsed, "path", dbPath)
@@ -282,26 +297,65 @@ func (f *FSM) openDBFile(dbPath string) error {
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
 
-	f.db = boltDB
-	return nil
+	return boltDB, err
+}
+
+func (f *FSM) closeDB(filename string) error {
+	if len(filename) == 0 {
+		return errors.New("can not open empty filename")
+	}
+	dbPath := filepath.Join(f.path, filename)
+
+	f.l.RLock()
+	defer f.l.RUnlock()
+
+	f.dbCache.Delete(filename)
+
+	return os.Remove(dbPath)
 }
 
 func (f *FSM) Stats() bolt.Stats {
 	f.l.RLock()
 	defer f.l.RUnlock()
 
-	return f.db.Stats()
+	var stats bolt.Stats
+	for _, db := range f.dbCache.Items() {
+		s := db.Object.Stats()
+		stats.FreePageN += s.FreePageN
+		stats.PendingPageN += s.PendingPageN
+		stats.FreeAlloc += s.FreeAlloc
+		stats.FreelistInuse += s.FreelistInuse
+		stats.TxN += s.TxN
+		stats.OpenTxN += s.OpenTxN
+		stats.TxStats.PageCount += s.TxStats.PageCount
+		stats.TxStats.PageAlloc += s.TxStats.PageAlloc
+		stats.TxStats.CursorCount += s.TxStats.CursorCount
+		stats.TxStats.NodeCount += s.TxStats.NodeCount
+		stats.TxStats.NodeDeref += s.TxStats.NodeDeref
+		stats.TxStats.Rebalance += s.TxStats.Rebalance
+		stats.TxStats.RebalanceTime += s.TxStats.RebalanceTime
+		stats.TxStats.Split += s.TxStats.Split
+		stats.TxStats.Spill += s.TxStats.Spill
+		stats.TxStats.SpillTime += s.TxStats.SpillTime
+		stats.TxStats.Write += s.TxStats.Write
+		stats.TxStats.WriteTime += s.TxStats.WriteTime
+	}
+	return stats
 }
 
 func (f *FSM) Close() error {
 	f.l.RLock()
 	defer f.l.RUnlock()
 
-	return f.db.Close()
+	for _, db := range f.dbCache.Items() {
+		if err := db.Object.Close(); err != nil {
+			return err
+		}
+	}
+
+	f.dbCache.DeleteAll()
+	return nil
 }
 
 func writeSnapshotMetaToDB(metadata *raft.SnapshotMeta, db *bolt.DB) error {
@@ -347,7 +401,11 @@ func writeSnapshotMetaToDB(metadata *raft.SnapshotMeta, db *bolt.DB) error {
 
 func (f *FSM) localNodeConfig() (*LocalNodeConfigValue, error) {
 	var configBytes []byte
-	if err := f.db.View(func(tx *bolt.Tx) error {
+	dbDefault, err := f.getDB(databaseFilename)
+	if err != nil {
+		return nil, err
+	}
+	if err := dbDefault.View(func(tx *bolt.Tx) error {
 		value := tx.Bucket(configBucketName).Get(localNodeConfigKey)
 		if value != nil {
 			configBytes = make([]byte, len(value))
@@ -458,7 +516,11 @@ func (f *FSM) persistDesiredSuffrage(lnconfig *LocalNodeConfigValue) error {
 		return err
 	}
 
-	return f.db.Update(func(tx *bolt.Tx) error {
+	dbDefault, err := f.getDB(databaseFilename)
+	if err != nil {
+		return err
+	}
+	return dbDefault.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(configBucketName).Put(localNodeConfigKey, dsBytes)
 	})
 }
@@ -467,7 +529,10 @@ func (f *FSM) witnessSnapshot(metadata *raft.SnapshotMeta) error {
 	f.l.RLock()
 	defer f.l.RUnlock()
 
-	err := writeSnapshotMetaToDB(metadata, f.db)
+	dbDefault, err := f.getDB(databaseFilename)
+	if err == nil {
+		err = writeSnapshotMetaToDB(metadata, dbDefault)
+	}
 	if err != nil {
 		return err
 	}
@@ -492,15 +557,20 @@ func (f *FSM) LatestState() (*IndexValue, *ConfigurationValue) {
 func (f *FSM) Delete(ctx context.Context, path string) error {
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "delete"}, time.Now())
 
+	var db *bolt.DB
+	bucketName, err := f.getBucketname(ctx)
+	if err == nil {
+		db, err = f.getDB(string(bucketName))
+	}
+	if err != nil {
+		return err
+	}
+
 	f.l.RLock()
 	defer f.l.RUnlock()
 
-	return f.db.Update(func(tx *bolt.Tx) error {
-		bucketName, err := f.getBucketname(ctx)
-		if err != nil {
-			return err
-		}
-		return tx.Bucket(bucketName).Delete([]byte(path))
+	return db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(dataBucketName).Delete([]byte(path))
 	})
 }
 
@@ -508,16 +578,21 @@ func (f *FSM) Delete(ctx context.Context, path string) error {
 func (f *FSM) DeletePrefix(ctx context.Context, prefix string) error {
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "delete_prefix"}, time.Now())
 
+	var db *bolt.DB
+	bucketName, err := f.getBucketname(ctx)
+	if err == nil {
+		db, err = f.getDB(string(bucketName))
+	}
+	if err != nil {
+		return err
+	}
+
 	f.l.RLock()
 	defer f.l.RUnlock()
 
-	err := f.db.Update(func(tx *bolt.Tx) error {
+	err = db.Update(func(tx *bolt.Tx) error {
 		// Assume bucket exists and has keys
-		bucketName, err := f.getBucketname(ctx)
-		if err != nil {
-			return err
-		}
-		c := tx.Bucket(bucketName).Cursor()
+		c := tx.Bucket(dataBucketName).Cursor()
 
 		prefixBytes := []byte(prefix)
 		for k, _ := c.Seek(prefixBytes); k != nil && bytes.HasPrefix(k, prefixBytes); k, _ = c.Next() {
@@ -538,18 +613,23 @@ func (f *FSM) Get(ctx context.Context, path string) (*physical.Entry, error) {
 	defer metrics.MeasureSince([]string{"raft", "get"}, time.Now())
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "get"}, time.Now())
 
+	var db *bolt.DB
+	bucketName, err := f.getBucketname(ctx)
+	if err == nil {
+		db, err = f.getDB(string(bucketName))
+	}
+	if err != nil {
+		return nil, err
+	}
+
 	f.l.RLock()
 	defer f.l.RUnlock()
 
 	var valCopy []byte
 	var found bool
 
-	err := f.db.View(func(tx *bolt.Tx) error {
-		bucketName, err := f.getBucketname(ctx)
-		if err != nil {
-			return err
-		}
-		value := tx.Bucket(bucketName).Get([]byte(path))
+	err = db.View(func(tx *bolt.Tx) error {
+		value := tx.Bucket(dataBucketName).Get([]byte(path))
 		if value != nil {
 			found = true
 			valCopy = make([]byte, len(value))
@@ -575,16 +655,21 @@ func (f *FSM) Get(ctx context.Context, path string) (*physical.Entry, error) {
 func (f *FSM) Put(ctx context.Context, entry *physical.Entry) error {
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "put"}, time.Now())
 
+	var db *bolt.DB
+	bucketName, err := f.getBucketname(ctx)
+	if err == nil {
+		db, err = f.getDB(string(bucketName))
+	}
+	if err != nil {
+		return err
+	}
+
 	f.l.RLock()
 	defer f.l.RUnlock()
 
 	// Start a write transaction.
-	return f.db.Update(func(tx *bolt.Tx) error {
-		bucketName, err := f.getBucketname(ctx)
-		if err != nil {
-			return err
-		}
-		return tx.Bucket(bucketName).Put([]byte(entry.Key), entry.Value)
+	return db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(dataBucketName).Put([]byte(entry.Key), entry.Value)
 	})
 }
 
@@ -601,17 +686,21 @@ func (f *FSM) ListPage(ctx context.Context, prefix string, after string, limit i
 	defer metrics.MeasureSince([]string{"raft", "list"}, time.Now())
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "list"}, time.Now())
 
+	var db *bolt.DB
+	bucketName, err := f.getBucketname(ctx)
+	if err == nil {
+		db, err = f.getDB(string(bucketName))
+	}
+	if err != nil {
+		return nil, err
+	}
+
 	f.l.RLock()
 	defer f.l.RUnlock()
 
-	var err error
 	var keys []string
-	err = f.db.View(func(tx *bolt.Tx) error {
-		bucketName, err := f.getBucketname(ctx)
-		if err != nil {
-			return err
-		}
-		keys, err = listPageInner(ctx, tx.Bucket(bucketName), prefix, after, limit)
+	err = db.View(func(tx *bolt.Tx) error {
+		keys, err = listPageInner(ctx, tx.Bucket(dataBucketName), prefix, after, limit)
 		if err != nil {
 			return err
 		}
@@ -799,7 +888,7 @@ func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommi
 
 // ApplyBatch will apply a set of logs to the FSM. This is called from the raft
 // library.
-func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
+func (f *FSM) ApplyBatchOld(logs []*raft.Log) []interface{} {
 	numLogs := len(logs)
 
 	if numLogs == 0 {
@@ -875,9 +964,14 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	//    log entry (that succeeded) when a later log entry fails.
 	//
 	// Hence, keep the original upstream ordering of Update w.r.t. batch
-	// application and switch to pre-verifying transactions prior to
+	// application and switch to pre-verifying transactions prior tok,
 	// performing any writes in them.
-	err = f.db.Update(func(tx *bolt.Tx) error {
+	dbDefault, err := f.getDB(databaseFilename)
+	if err != nil {
+		f.logger.Error("failed to get default database", "error", err)
+		panic("failed to get default database")
+	}
+	err = dbDefault.Update(func(tx *bolt.Tx) error {
 		configB := tx.Bucket(configBucketName)
 		latestIndex := atomic.LoadUint64(f.latestIndex)
 
@@ -887,12 +981,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			switch command := commandRaw.(type) {
 			case *LogData:
 				txnState := f.fastTxnTracker.applyState(latestIndex, commandIndex, logs[commandIndex].Index)
-
-				bucketName := dataBucketName
-				if command.BucketName != nil {
-					bucketName = []byte(*command.BucketName)
-				}
-				b := tx.Bucket(bucketName)
+				b := tx.Bucket(dataBucketName)
 				if len(command.Operations) == 0 || command.Operations[0].OpType != beginTxOp {
 					err = f.applyBatchNonTxOps(b, txnState, command)
 				} else {
@@ -944,7 +1033,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 
 	// If we had no error, update our last applied log.
 	if err == nil {
-		err = f.db.Update(func(tx *bolt.Tx) error {
+		err = dbDefault.Update(func(tx *bolt.Tx) error {
 			if len(logIndex) > 0 {
 				b := tx.Bucket(configBucketName)
 				err = b.Put(latestIndexKey, logIndex)
@@ -955,6 +1044,212 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 
 			return nil
 		})
+	}
+
+	if err != nil {
+		f.logger.Error("failed to store data", "error", err)
+		panic("failed to store data")
+	}
+
+	if lowestActiveIndex != nil {
+		f.fastTxnTracker.clearOldEntries(*lowestActiveIndex)
+	}
+
+	// If we advanced the latest value, update the in-memory representation too.
+	if len(logIndex) > 0 {
+		atomic.StoreUint64(f.latestTerm, lastLog.Term)
+		atomic.StoreUint64(f.latestIndex, lastLog.Index)
+	}
+
+	// If one or more configuration changes were processed, store the latest one.
+	if latestConfiguration != nil {
+		f.latestConfig.Store(latestConfiguration)
+	}
+
+	// Build the responses. The logs array is used here to ensure we reply to
+	// all command values; even if they are not of the types we expect. This
+	// should futureproof this function from more log types being provided.
+	resp := make([]interface{}, numLogs)
+	for i := range logs {
+		resp[i] = &FSMApplyResponse{
+			Success:    true,
+			EntrySlice: entrySlices[i],
+		}
+	}
+
+	return resp
+}
+
+// this is copied from the latest branch 0dcb577 before "Improve raft transaction application performance (#634)"
+// ApplyBatch will apply a set of logs to the FSM. This is called from the raft
+// library.
+func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
+	numLogs := len(logs)
+
+	if numLogs == 0 {
+		return []interface{}{}
+	}
+
+	dbList := make([]*bolt.DB, numLogs)
+	dbName := make([]string, numLogs)
+
+	// We will construct one slice per log, each slice containing another slice of results from our get ops
+	entrySlices := make([][]*FSMEntry, 0, numLogs)
+
+	// Do the unmarshalling first so we don't hold locks
+	var latestConfiguration *ConfigurationValue
+	commands := make([]interface{}, 0, numLogs)
+	for i, l := range logs {
+		bucketName := string(dataBucketName)
+		switch l.Type {
+		case raft.LogCommand:
+			command := &LogData{}
+			err := proto.Unmarshal(l.Data, command)
+			if err != nil {
+				f.logger.Error("error proto unmarshaling log data", "error", err)
+				panic("error proto unmarshaling log data")
+			}
+			commands[i] = command
+			if command.BucketName != nil {
+				bucketName = *command.BucketName
+			}
+		case raft.LogConfiguration:
+			configuration := raft.DecodeConfiguration(l.Data)
+			config := raftConfigurationToProtoConfiguration(l.Index, configuration)
+
+			commands[i] = config
+
+			// Update the latest configuration the fsm has received; we will
+			// store this after it has been committed to storage.
+			latestConfiguration = config
+		default:
+			panic(fmt.Sprintf("got unexpected log type: %d", l.Type))
+		}
+		db, err := f.getDB(bucketName)
+		if err != nil {
+			f.logger.Error("unable to get db", "error", err, "bucket", bucketName)
+			panic("unable to get db")
+		}
+		dbName[i] = bucketName
+		dbList[i] = db
+	}
+	// Only advance latest pointer if this log has a higher index value than
+	// what we have seen in the past.
+	var logIndex []byte
+	var err error
+	latestIndex, _ := f.LatestState()
+	lastLog := logs[numLogs-1]
+	if latestIndex.Index < lastLog.Index {
+		logIndex, err = proto.Marshal(&IndexValue{
+			Term:  lastLog.Term,
+			Index: lastLog.Index,
+		})
+		if err != nil {
+			f.logger.Error("unable to marshal latest index", "error", err)
+			panic("unable to marshal latest index")
+		}
+	}
+
+	latestIndexAtomic := atomic.LoadUint64(f.latestIndex)
+
+	var lowestActiveIndex *uint64
+
+	f.l.RLock()
+	defer f.l.RUnlock()
+
+	if f.applyCallback != nil {
+		f.applyCallback()
+	}
+
+	// This loop and subsequent f.db.Update call were reordered from upstream,
+	// to enable one transaction per command. Raft chunking will already be
+	// applied, so if logs are split across multiple operations, we'll see
+	// only a single call here. This ensures that our transaction really will
+	// apply at the bolt level, independent of the other operations occurring,
+	// and lets us back out just the changes in the transaction if they fail
+	// to apply.
+	for commandIndex, commandRaw := range commands {
+		inTx := false
+		entrySlice := make([]*FSMEntry, 0)
+		err = dbList[commandIndex].Update(func(tx *bolt.Tx) error {
+			switch command := commandRaw.(type) {
+			case *LogData:
+				b := tx.Bucket(dataBucketName)
+				txnState := f.fastTxnTracker.applyState(latestIndexAtomic, commandIndex, logs[commandIndex].Index)
+				if len(command.Operations) == 0 || command.Operations[0].OpType != beginTxOp {
+					err = f.applyBatchNonTxOps(b, txnState, command)
+				} else {
+					err = f.applyBatchTxOps(tx, b, txnState, command)
+				}
+
+				if command.LowestActiveIndex != nil {
+					lowestActiveIndex = command.LowestActiveIndex
+				}
+
+				if err != nil {
+					// If we're in a transaction, we do not want to err the
+					// global f.db.Update call unless this is a critical error
+					// worthy of a panic(...).
+					//
+					// Create a special FSMEntry to send back the error
+					// message, that applyLog(...) will look for if it
+					// sent a transaction.
+					if txnState.getInTx() && errors.Is(err, physical.ErrTransactionCommitFailure) {
+						entrySlice = append(entrySlice, &FSMEntry{
+							Key:   fsmEntryTxErrorKey,
+							Value: []byte(err.Error()),
+						})
+
+						// Process other events; this transaction failure was handled
+						// appropriately already in applyBatchTxOps.
+						err = nil
+					}
+				}
+			case *ConfigurationValue:
+				b := tx.Bucket(configBucketName)
+				configBytes, err := proto.Marshal(command)
+				if err != nil {
+					return err
+				}
+				if err := b.Put(latestConfigKey, configBytes); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		})
+
+		entrySlices[commandIndex] = entrySlice
+
+		if err != nil && inTx && errors.Is(err, physical.ErrTransactionCommitFailure) {
+			// Process other events; this transaction failure was handled
+			// appropriately.
+			err = nil
+			continue
+		}
+
+		if err != nil {
+			// Unknown error type or non-transactional error; exit and panic.
+			break
+		}
+	}
+
+	if err == nil {
+		var db *bolt.DB
+		db, err = f.getDB(databaseFilename)
+		if err == nil {
+			err = db.Update(func(tx *bolt.Tx) error {
+				if len(logIndex) > 0 {
+					b := tx.Bucket(configBucketName)
+					err = b.Put(latestIndexKey, logIndex)
+					if err != nil {
+						return err
+					}
+				}
+
+				return nil
+			})
+		}
 	}
 
 	if err != nil {
@@ -1012,16 +1307,21 @@ func (f *FSM) writeTo(ctx context.Context, metaSink writeErrorCloser, sink write
 	protoWriter := NewDelimitedWriter(sink)
 	metadataProtoWriter := NewDelimitedWriter(metaSink)
 
+	var db *bolt.DB
+	bucketName, err := f.getBucketname(ctx)
+	if err == nil {
+		db, err = f.getDB(string(bucketName))
+	}
+	if err != nil {
+		sink.CloseWithError(err)
+		return
+	}
+
 	f.l.RLock()
 	defer f.l.RUnlock()
 
-	err := f.db.View(func(tx *bolt.Tx) error {
-		bucketName, err := f.getBucketname(ctx)
-		if err != nil {
-			return err
-		}
-		b := tx.Bucket(bucketName)
-
+	err = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(dataBucketName)
 		c := b.Cursor()
 
 		// Do the first scan of the data for metadata purposes.
@@ -1092,6 +1392,11 @@ func (f *FSM) Restore(r io.ReadCloser) error {
 		}
 	}
 
+	dbDefault, err := f.getDB(databaseFilename)
+	if err != nil {
+		return err
+	}
+
 	f.l.Lock()
 	defer f.l.Unlock()
 
@@ -1102,7 +1407,7 @@ func (f *FSM) Restore(r io.ReadCloser) error {
 	}
 
 	// Close the db file
-	if err := f.db.Close(); err != nil {
+	if err := dbDefault.Close(); err != nil {
 		f.logger.Error("failed to close database file", "error", err)
 		return err
 	}
@@ -1122,7 +1427,7 @@ func (f *FSM) Restore(r io.ReadCloser) error {
 
 	// Open the db file. We want to do this regardless of if the above install
 	// worked. If the install failed we should try to open the old DB file.
-	if err := f.openDBFile(dbPath); err != nil {
+	if _, err := f.openDBFile(databaseFilename); err != nil {
 		f.logger.Error("failed to open new database file", "error", err)
 		retErr = multierror.Append(retErr, fmt.Errorf("failed to open new bolt file: %w", err))
 	}
@@ -1223,22 +1528,27 @@ func (f *FSMChunkStorage) StoreChunk(chunk *raftchunking.ChunkInfo) (bool, error
 		Value: b,
 	}
 
+	var db *bolt.DB
+	bucketName, err := f.f.getBucketname(f.ctx)
+	if err == nil {
+		db, err = f.f.getDB(string(bucketName))
+	}
+	if err != nil {
+		return false, err
+	}
+
 	f.f.l.RLock()
 	defer f.f.l.RUnlock()
 
 	// Start a write transaction.
 	done := new(bool)
-	if err := f.f.db.Update(func(tx *bolt.Tx) error {
-		bucketName, err := f.f.getBucketname(f.ctx)
-		if err != nil {
-			return err
-		}
-		if err := tx.Bucket(bucketName).Put([]byte(entry.Key), entry.Value); err != nil {
+	if err := db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(dataBucketName).Put([]byte(entry.Key), entry.Value); err != nil {
 			return fmt.Errorf("error storing chunk info: %w", err)
 		}
 
 		// Assume bucket exists and has keys
-		c := tx.Bucket(bucketName).Cursor()
+		c := tx.Bucket(dataBucketName).Cursor()
 
 		var keys []string
 		prefixBytes := []byte(prefix)

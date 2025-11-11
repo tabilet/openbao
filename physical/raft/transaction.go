@@ -196,6 +196,16 @@ func (b *RaftBackend) newTransaction(ctx context.Context, writable bool) (*RaftT
 	// to prevent key changes from occurring while a transaction is ongoing.
 	// These will be released when we finish this transaction.
 	b.txnPermitPool.Acquire()
+
+	bucketName, err := b.fsm.getBucketname(ctx)
+	if err != nil {
+		return nil, err
+	}
+	db, err := b.fsm.getDB(string(bucketName))
+	if err != nil {
+		return nil, err
+	}
+
 	b.fsm.l.RLock()
 
 	// Grab the last seen WAL index prior to starting the transaction for
@@ -207,7 +217,7 @@ func (b *RaftBackend) newTransaction(ctx context.Context, writable bool) (*RaftT
 
 	// All underlying bbolt transactions are read-only; this gives us a
 	// consistent view of storage but means we need to track writes ourselves.
-	tx, err := b.fsm.db.Begin(false)
+	tx, err := db.Begin(false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start underlying bbolt transaction: %w", err)
 	}
@@ -229,6 +239,7 @@ func (b *RaftBackend) newTransaction(ctx context.Context, writable bool) (*RaftT
 }
 
 func (t *RaftTransaction) Put(ctx context.Context, entry *physical.Entry) error {
+
 	t.l.Lock()
 	defer t.l.Unlock()
 
@@ -262,11 +273,7 @@ func (t *RaftTransaction) Put(ctx context.Context, entry *physical.Entry) error 
 			// It is safe to go to the underlying transaction here as we
 			// hold an exclusive write lock here and so there's no parallel
 			// writers to the same key.
-			bucketName, err := t.b.fsm.getBucketname(ctx)
-			if err != nil {
-				return err
-			}
-			value := t.tx.Bucket(bucketName).Get([]byte(entry.Key))
+			value := t.tx.Bucket(dataBucketName).Get([]byte(entry.Key))
 			contentsHash, err := createVerificationEntry(entry.Key, value)
 			if err != nil {
 				return err
@@ -328,11 +335,7 @@ func (t *RaftTransaction) Get(ctx context.Context, key string) (*physical.Entry,
 	}
 
 	// Otherwise, ask the underlying transaction for this value.
-	bucketName, err := t.b.fsm.getBucketname(ctx)
-	if err != nil {
-		return nil, err
-	}
-	value := t.tx.Bucket(bucketName).Get([]byte(key))
+	value := t.tx.Bucket(dataBucketName).Get([]byte(key))
 
 	if _, present := t.reads[key]; !present {
 		// Hash the contents so that we can add a verify operation.
@@ -381,11 +384,7 @@ func (t *RaftTransaction) Delete(ctx context.Context, key string) error {
 		// we have.
 		if _, present := t.reads[key]; !present {
 			// See notes above in Put(...) for why this is safe.
-			bucketName, err := t.b.fsm.getBucketname(ctx)
-			if err != nil {
-				return err
-			}
-			value := t.tx.Bucket(bucketName).Get([]byte(key))
+			value := t.tx.Bucket(dataBucketName).Get([]byte(key))
 			contentsHash, err := createVerificationEntry(key, value)
 			if err != nil {
 				return err
@@ -466,11 +465,7 @@ func (t *RaftTransaction) ListPage(ctx context.Context, prefix string, after str
 	}
 
 	// Assume the bucket exists and has keys.
-	bucketName, err := t.b.fsm.getBucketname(ctx)
-	if err != nil {
-		return nil, err
-	}
-	c := t.tx.Bucket(bucketName).Cursor()
+	c := t.tx.Bucket(dataBucketName).Cursor()
 
 	// Build a map of updates and deletions (in the prefix!) for fast lookup.
 	deletions := map[string]struct{}{}

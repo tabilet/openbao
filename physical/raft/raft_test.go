@@ -48,7 +48,19 @@ func compareFSMsWithErr(t *testing.T, fsm1, fsm2 *FSM) error {
 		return fmt.Errorf("configs did not match: %+v != %+v", config1, config2)
 	}
 
-	return compareDBs(t, fsm1.getDB(), fsm2.getDB(), false)
+	db1, err := fsm1.getDB(databaseFilename)
+	if err != nil {
+		return err
+	}
+	defer db1.Close()
+
+	db2, err := fsm2.getDB(databaseFilename)
+	if err != nil {
+		return err
+	}
+	defer db2.Close()
+
+	return compareDBs(t, db1, db2, false)
 }
 
 func compareDBs(t *testing.T, boltDB1, boltDB2 *bolt.DB, dataOnly bool) error {
@@ -63,7 +75,7 @@ func compareDBs(t *testing.T, boltDB1, boltDB2 *bolt.DB, dataOnly bool) error {
 				continue
 			}
 
-			b := tx.Bucket(bucketName)
+			b := tx.Bucket(dataBucketName)
 
 			cBucket := b.Cursor()
 
@@ -84,7 +96,7 @@ func compareDBs(t *testing.T, boltDB1, boltDB2 *bolt.DB, dataOnly bool) error {
 			if dataOnly && !bytes.Equal(bucketName, dataBucketName) {
 				continue
 			}
-			b := tx.Bucket(bucketName)
+			b := tx.Bucket(dataBucketName)
 
 			c := b.Cursor()
 

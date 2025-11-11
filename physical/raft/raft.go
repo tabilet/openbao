@@ -83,6 +83,9 @@ var (
 	defaultMaxTxnSize      = 8 * defaultMaxEntrySize
 
 	GetInTxnDisabledError = errors.New("get operations inside transactions are disabled in raft backend")
+
+	otherDBDefaultExpiry   = time.Minute * 5
+	otherDBCleanupInterval = time.Minute * 10
 )
 
 // RaftBackend implements the backend interfaces and uses the raft protocol to
@@ -385,8 +388,26 @@ func NewRaftBackend(conf map[string]string, logger log.Logger) (physical.Backend
 		}
 	}
 
+	var expire, cleanup time.Duration
+	expire = otherDBDefaultExpiry
+	cleanup = otherDBCleanupInterval
+	if mExpire, ok := conf["other_db_expiry"]; ok && mExpire != "" {
+		d, err := parseutil.ParseDurationSecond(mExpire)
+		if err != nil {
+			return nil, fmt.Errorf("other_db_expiry does not parse as a duration: %w", err)
+		}
+		expire = d
+	}
+	if mCleanup, ok := conf["other_db_cleanup"]; ok && mCleanup != "" {
+		d, err := parseutil.ParseDurationSecond(mCleanup)
+		if err != nil {
+			return nil, fmt.Errorf("other_db_cleanup does not parse as a duration: %w", err)
+		}
+		cleanup = d
+	}
+
 	// Create the FSM.
-	fsm, err := NewFSM(path, localID, strings.ToLower(conf["m_enabled"]) == "true", logger.Named("fsm"))
+	fsm, err := NewFSM(path, localID, strings.ToLower(conf["m_enabled"]) == "true", expire, cleanup, logger.Named("fsm"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create fsm: %v", err)
 	}
@@ -1915,18 +1936,27 @@ func (b *RaftBackend) CreateIfNotExists(ctx context.Context, path, uuid string) 
 		return nil
 	}
 
-	parent, err := b.getBucketname(ctx)
-	if err != nil {
-		return err
-	}
-	db := b.fsm.getDB()
-	return db.Update(func(tx *bolt.Tx) error {
-		if tx.Bucket([]byte(parent)) == nil {
-			return fmt.Errorf("parent %s does not exist", parent)
+	var db *bolt.DB
+	parent, err := b.getBucketnameString(ctx)
+	if err == nil {
+		if parent == databaseFilename {
+			return fmt.Errorf("cannot create the default database")
 		}
-		_, err := tx.CreateBucketIfNotExists([]byte(uuid))
-		return err
-	})
+		db, err = b.fsm.getDB(parent)
+		if err == nil {
+			err = db.Update(func(tx *bolt.Tx) error {
+				if tx.Bucket(dataBucketName) == nil {
+					return fmt.Errorf("parent %s does not exist", parent)
+				}
+				return nil
+			})
+			if err == nil {
+				_, err = b.fsm.getDB(uuid)
+			}
+		}
+	}
+
+	return err
 }
 
 // DropIfExists drop the table if it exists.
@@ -1935,17 +1965,43 @@ func (b *RaftBackend) DropIfExists(ctx context.Context, path, uuid string) error
 		return nil
 	}
 
-	parent, err := b.getBucketname(ctx)
-	if err != nil {
-		return err
-	}
-	db := b.fsm.getDB()
-	return db.Update(func(tx *bolt.Tx) error {
-		if tx.Bucket([]byte(parent)) == nil {
-			return fmt.Errorf("parent %s does not exist", parent)
+	var db *bolt.DB
+	parent, err := b.getBucketnameString(ctx)
+	if err == nil {
+		if parent == databaseFilename {
+			return fmt.Errorf("cannot drop the default database bucket")
 		}
-		return tx.DeleteBucket([]byte(uuid))
-	})
+		db, err = b.fsm.getDB(parent)
+		if err == nil {
+			err = db.Update(func(tx *bolt.Tx) error {
+				if tx.Bucket(dataBucketName) == nil {
+					return fmt.Errorf("parent %s does not exist", parent)
+				}
+				return nil
+			})
+			if err == nil {
+				db, err = b.fsm.getDB(uuid)
+				if err == nil {
+					err = db.Update(func(tx *bolt.Tx) error {
+						if tx.Bucket(dataBucketName) != nil {
+							if e := tx.DeleteBucket(dataBucketName); e != nil {
+								return e
+							}
+						}
+						if tx.Bucket(configBucketName) != nil {
+							return tx.DeleteBucket(configBucketName)
+						}
+						return nil
+					})
+					if err == nil {
+						err = b.fsm.closeDB(uuid)
+					}
+				}
+			}
+		}
+	}
+
+	return err
 }
 
 // RaftLock implements the physical Lock interface and enables HA for this
