@@ -211,7 +211,7 @@ func (f *BoltSnapshotStore) getMetaFromDB(id string) (*raft.SnapshotMeta, error)
 		return nil, errors.New("can not open empty snapshot ID")
 	}
 
-	filename := filepath.Join(f.path, id, databaseFilename)
+	filename := filepath.Join(f.path, id, databaseFilename())
 	boltDB, err := bolt.Open(filename, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		return nil, err
@@ -263,7 +263,7 @@ func (f *BoltSnapshotStore) openFromFile(id string) (*raft.SnapshotMeta, io.Read
 		return nil, nil, err
 	}
 
-	filename := filepath.Join(f.path, id, databaseFilename)
+	filename := filepath.Join(f.path, id, databaseFilename())
 	installer := &boltSnapshotInstaller{
 		meta:       meta,
 		ReadCloser: io.NopCloser(strings.NewReader(filename)),
@@ -331,7 +331,7 @@ func (s *BoltSnapshotSink) writeBoltDBFile() error {
 	}
 
 	// Create the BoltDB file
-	dbPath := filepath.Join(path, databaseFilename)
+	dbPath := filepath.Join(path, databaseFilename())
 	boltDB, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		return err
@@ -358,7 +358,7 @@ func (s *BoltSnapshotSink) writeBoltDBFile() error {
 	s.writer = writer
 
 	// Start a go routine in charge of piping data from the snapshot's Write
-	// call to the delimtedreader and the BoltDB file.
+	// call to the delimtedreader and the BoltDB file(s).
 	go func() {
 		defer close(s.doneWritingCh)
 		defer boltDB.Close()
@@ -371,8 +371,11 @@ func (s *BoltSnapshotSink) writeBoltDBFile() error {
 		var done bool
 		var keys int
 		entry := new(pb.StorageEntry)
+		currentDB := boltDB
+		currentDBName := databaseFilename()
+
 		for !done {
-			err := boltDB.Update(func(tx *bolt.Tx) error {
+			err := currentDB.Update(func(tx *bolt.Tx) error {
 				b, err := tx.CreateBucketIfNotExists(dataBucketName)
 				if err != nil {
 					return err
@@ -390,6 +393,20 @@ func (s *BoltSnapshotSink) writeBoltDBFile() error {
 						return err
 					}
 
+					// Check for database marker entry
+					if strings.HasPrefix(entry.Key, "__DATABASE__:") {
+						// Extract database name from marker
+						newDBName := string(entry.Value)
+						if newDBName != currentDBName {
+							s.logger.Info("snapshot restore: switching to database", "database", newDBName)
+
+							// Commit current transaction before switching databases
+							return nil
+						}
+						// Skip the marker entry itself, don't write it to the database
+						continue
+					}
+
 					err = b.Put([]byte(entry.Key), entry.Value)
 					if err != nil {
 						return err
@@ -403,6 +420,65 @@ func (s *BoltSnapshotSink) writeBoltDBFile() error {
 				s.logger.Error("snapshot write: failed to write transaction", "error", err)
 				s.writeError = err
 				return
+			}
+
+			// Check if we need to switch databases after the batch
+			// Read ahead to see if next entry is a database marker
+			peekEntry := new(pb.StorageEntry)
+			err = protoReader.ReadMsg(peekEntry)
+			if err != nil {
+				if err == io.EOF {
+					done = true
+				} else {
+					s.logger.Error("snapshot write: failed to read next entry", "error", err)
+					s.writeError = err
+					return
+				}
+			} else if strings.HasPrefix(peekEntry.Key, "__DATABASE__:") {
+				// Switch to new database
+				newDBName := string(peekEntry.Value)
+				if newDBName != currentDBName {
+					// Close current database
+					if err := currentDB.Close(); err != nil {
+						s.logger.Error("snapshot write: failed to close database", "database", currentDBName, "error", err)
+					}
+
+					// Open new database
+					newDBPath := filepath.Join(path, newDBName)
+					newDB, err := bolt.Open(newDBPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
+					if err != nil {
+						s.logger.Error("snapshot write: failed to open new database", "database", newDBName, "error", err)
+						s.writeError = err
+						return
+					}
+
+					// Write snapshot metadata to new database
+					if err := writeSnapshotMetaToDB(&s.meta, newDB); err != nil {
+						s.logger.Error("snapshot write: failed to write metadata", "database", newDBName, "error", err)
+						s.writeError = err
+						return
+					}
+
+					currentDB = newDB
+					currentDBName = newDBName
+					s.logger.Info("snapshot restore: switched to database", "database", newDBName)
+				}
+			} else {
+				// Put the peeked entry back by processing it immediately
+				entry = peekEntry
+				err := currentDB.Update(func(tx *bolt.Tx) error {
+					b, err := tx.CreateBucketIfNotExists(dataBucketName)
+					if err != nil {
+						return err
+					}
+					return b.Put([]byte(entry.Key), entry.Value)
+				})
+				if err != nil {
+					s.logger.Error("snapshot write: failed to write peeked entry", "error", err)
+					s.writeError = err
+					return
+				}
+				keys += 1
 			}
 
 			s.logger.Trace("snapshot write: writing keys", "num_written", keys)

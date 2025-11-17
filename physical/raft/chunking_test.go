@@ -84,7 +84,7 @@ func TestRaft_Chunking_Lifecycle(t *testing.T) {
 
 	t.Log("tearing down cluster")
 	require.NoError(b.TeardownCluster(nil))
-	db, err := b.fsm.getDB(databaseFilename)
+	db, err := b.fsm.getDB(databaseFilename())
 	require.NoError(err)
 	require.NoError(db.Close())
 	require.NoError(b.stableStore.(*raftboltdb.BoltStore).Close())

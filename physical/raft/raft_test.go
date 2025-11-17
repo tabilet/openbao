@@ -48,13 +48,13 @@ func compareFSMsWithErr(t *testing.T, fsm1, fsm2 *FSM) error {
 		return fmt.Errorf("configs did not match: %+v != %+v", config1, config2)
 	}
 
-	db1, err := fsm1.getDB(databaseFilename)
+	db1, err := fsm1.getDB(databaseFilename())
 	if err != nil {
 		return err
 	}
 	defer db1.Close()
 
-	db2, err := fsm2.getDB(databaseFilename)
+	db2, err := fsm2.getDB(databaseFilename())
 	if err != nil {
 		return err
 	}

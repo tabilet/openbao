@@ -197,11 +197,11 @@ func (b *RaftBackend) newTransaction(ctx context.Context, writable bool) (*RaftT
 	// These will be released when we finish this transaction.
 	b.txnPermitPool.Acquire()
 
-	bucketName, err := b.fsm.getBucketname(ctx)
+	dbName, err := b.fsm.getDatabaseName(ctx)
 	if err != nil {
 		return nil, err
 	}
-	db, err := b.fsm.getDB(string(bucketName))
+	db, err := b.fsm.getDB(dbName)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +239,6 @@ func (b *RaftBackend) newTransaction(ctx context.Context, writable bool) (*RaftT
 }
 
 func (t *RaftTransaction) Put(ctx context.Context, entry *physical.Entry) error {
-
 	t.l.Lock()
 	defer t.l.Unlock()
 
@@ -622,6 +621,9 @@ func (t *RaftTransaction) ListPage(ctx context.Context, prefix string, after str
 }
 
 func (t *RaftTransaction) Commit(ctx context.Context) error {
+	defer t.b.fsm.l.RUnlock() // line 209  b.fsm.l.RLock() NEVER UNLOCKED ← Released here!
+	defer t.b.txnPermitPool.Release()
+
 	t.l.Lock()
 	defer t.l.Unlock()
 
@@ -684,13 +686,13 @@ func (t *RaftTransaction) Commit(ctx context.Context) error {
 		return err
 	}
 
-	bucketName, err := t.b.fsm.getBucketnameString(ctx)
+	dbName, err := t.b.fsm.getDatabaseName(ctx)
 	if err != nil {
 		return err
 	}
 
 	log := &LogData{
-		BucketName: &bucketName,
+		BucketName: &dbName,
 		// While list operations may contribute more (if the list was issued
 		// with the same prefix with different after and limit values), this
 		// is a good approximation as to the size of the operation log and

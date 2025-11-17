@@ -253,13 +253,13 @@ func TestRaft_Snapshot_Peers(t *testing.T) {
 
 	ensureCommitApplied(t, commitIdx, raft2)
 
-	db1, err := raft1.fsm.getDB(databaseFilename)
+	db1, err := raft1.fsm.getDB(databaseFilename())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db1.Close()
 
-	db2, err := raft2.fsm.getDB(databaseFilename)
+	db2, err := raft2.fsm.getDB(databaseFilename())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +573,7 @@ func TestBoltSnapshotStore_CreateSnapshotMissingParentDir(t *testing.T) {
 	}
 
 	// Ensure the snapshot file exists
-	_, err = os.Stat(filepath.Join(snap.path, sink.ID()+tmpSuffix, databaseFilename))
+	_, err = os.Stat(filepath.Join(snap.path, sink.ID()+tmpSuffix, databaseFilename()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -765,13 +765,13 @@ func TestBoltSnapshotStore_CreateInstallSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db1, err := fsm.getDB(databaseFilename)
+	db1, err := fsm.getDB(databaseFilename())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db1.Close()
 
-	db2, err := newFSM.getDB(databaseFilename)
+	db2, err := newFSM.getDB(databaseFilename())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -868,7 +868,7 @@ func TestBoltSnapshotStore_CancelSnapshot(t *testing.T) {
 	}
 
 	// Ensure the snapshot file exists
-	_, err = os.Stat(filepath.Join(snap.path, sink.ID()+tmpSuffix, databaseFilename))
+	_, err = os.Stat(filepath.Join(snap.path, sink.ID()+tmpSuffix, databaseFilename()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -880,7 +880,7 @@ func TestBoltSnapshotStore_CancelSnapshot(t *testing.T) {
 	}
 
 	// Ensure the snapshot file does not exist
-	_, err = os.Stat(filepath.Join(snap.path, sink.ID()+tmpSuffix, databaseFilename))
+	_, err = os.Stat(filepath.Join(snap.path, sink.ID()+tmpSuffix, databaseFilename()))
 	if !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
@@ -965,7 +965,7 @@ func TestBoltSnapshotStore_CloseFailure(t *testing.T) {
 	}
 
 	// Ensure the snapshot file does not exist
-	_, err = os.Stat(filepath.Join(snap.path, sink.ID()+tmpSuffix, databaseFilename))
+	_, err = os.Stat(filepath.Join(snap.path, sink.ID()+tmpSuffix, databaseFilename()))
 	if !os.IsNotExist(err) {
 		t.Fatal(err)
 	}

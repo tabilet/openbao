@@ -58,7 +58,7 @@ func GetTestPostgreSQLBackend(t *testing.T, logger log.Logger) (physical.Backend
 
 	pg, err := NewPostgreSQLBackend(map[string]string{
 		"connection_url": url,
-		"ha_enable":      "true",
+		"ha_enabled":     "true",
 	}, logger)
 	require.NoError(t, err, "failed initializing postgres database")
 

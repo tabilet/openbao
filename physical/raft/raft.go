@@ -6,6 +6,7 @@ package raft
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -69,6 +70,7 @@ var (
 	_ physical.Transactional = (*RaftBackend)(nil)
 	_ physical.HABackend     = (*RaftBackend)(nil)
 	_ physical.Lock          = (*RaftLock)(nil)
+	_ physical.Mountable     = (*RaftBackend)(nil)
 )
 
 var (
@@ -1626,13 +1628,13 @@ func (b *RaftBackend) Delete(ctx context.Context, path string) error {
 		return err
 	}
 
-	bucketName, err := b.getBucketnameString(ctx)
+	dbName, err := b.getDatabaseName(ctx)
 	if err != nil {
 		return err
 	}
 
 	command := &LogData{
-		BucketName: &bucketName,
+		BucketName: &dbName,
 		Operations: []*LogOperation{
 			{
 				OpType: deleteOp,
@@ -1692,13 +1694,13 @@ func (b *RaftBackend) Put(ctx context.Context, entry *physical.Entry) error {
 		return err
 	}
 
-	bucketName, err := b.getBucketnameString(ctx)
+	dbName, err := b.getDatabaseName(ctx)
 	if err != nil {
 		return err
 	}
 
 	command := &LogData{
-		BucketName: &bucketName,
+		BucketName: &dbName,
 		Operations: []*LogOperation{
 			{
 				OpType: putOp,
@@ -1899,106 +1901,71 @@ func (b *RaftBackend) BeginTx(ctx context.Context) (physical.Transaction, error)
 	return b.newTransaction(ctx, true)
 }
 
-// getBucketname returns the quoted table name for the current context.
-func getBucketname(ctx context.Context) ([]byte, error) {
+func databaseFilename(uuid ...string) string {
+	if len(uuid) == 0 {
+		return databaseFilenameBase + databaseFilenameExt
+	}
+	return fmt.Sprintf("%s_v_%x%s", databaseFilenameBase, md5.Sum([]byte(uuid[0])), databaseFilenameExt)
+}
+
+// getDatabaseName returns the quoted table name for the current context.
+func getDatabaseName(ctx context.Context) (string, error) {
 	ns, err := namespace.FromContext(ctx)
 	if err != nil && err == namespace.ErrNoNamespace {
-		return dataBucketName, nil
+		return databaseFilename(), nil
 	} else if err != nil {
-		return nil, fmt.Errorf("namespace in ctx error: %w", err)
+		return "", fmt.Errorf("namespace in ctx error: %w", err)
 	}
 
-	if ns.Path == "" {
-		return dataBucketName, nil
+	if ns.Path == "" || ns.UUID == namespace.RootNamespace.UUID {
+		return databaseFilename(), nil
 	}
-	return []byte(ns.UUID), nil
+
+	return databaseFilename(ns.UUID), nil
 }
 
-func (b *RaftBackend) getBucketname(ctx context.Context) ([]byte, error) {
+func (b *RaftBackend) getDatabaseName(ctx context.Context) (string, error) {
 	if !b.mEnabled {
-		return dataBucketName, nil
+		return databaseFilename(), nil
 	}
 
-	return getBucketname(ctx)
+	return getDatabaseName(ctx)
 }
 
-func (b *RaftBackend) getBucketnameString(ctx context.Context) (string, error) {
-	bs, err := b.getBucketname(ctx)
-	if err != nil {
-		return "", err
-	}
-	return string(bs), nil
-}
-
-// CreateIfNotExists creates the table if it does not exist.
-func (b *RaftBackend) CreateIfNotExists(ctx context.Context, path, uuid string) error {
+// CreateMountView creates the child database if it does not exist.
+func (b *RaftBackend) CreateMountView(ctx context.Context, path, uuid string) error {
 	if !b.mEnabled {
 		return nil
 	}
 
-	var db *bolt.DB
-	parent, err := b.getBucketnameString(ctx)
-	if err == nil {
-		if parent == databaseFilename {
-			return fmt.Errorf("cannot create the default database")
-		}
-		db, err = b.fsm.getDB(parent)
-		if err == nil {
-			err = db.Update(func(tx *bolt.Tx) error {
-				if tx.Bucket(dataBucketName) == nil {
-					return fmt.Errorf("parent %s does not exist", parent)
-				}
-				return nil
-			})
-			if err == nil {
-				_, err = b.fsm.getDB(uuid)
-			}
-		}
-	}
+	_, err := b.fsm.getDB(databaseFilename(uuid))
 
 	return err
 }
 
-// DropIfExists drop the table if it exists.
-func (b *RaftBackend) DropIfExists(ctx context.Context, path, uuid string) error {
+// DeleteMountView drops the child database if it exists.
+func (b *RaftBackend) DeleteMountView(ctx context.Context, path, uuid string) error {
 	if !b.mEnabled {
 		return nil
 	}
 
-	var db *bolt.DB
-	parent, err := b.getBucketnameString(ctx)
+	_, err := b.fsm.getDB(databaseFilename(uuid))
 	if err == nil {
-		if parent == databaseFilename {
-			return fmt.Errorf("cannot drop the default database bucket")
-		}
-		db, err = b.fsm.getDB(parent)
-		if err == nil {
-			err = db.Update(func(tx *bolt.Tx) error {
-				if tx.Bucket(dataBucketName) == nil {
-					return fmt.Errorf("parent %s does not exist", parent)
-				}
-				return nil
-			})
-			if err == nil {
-				db, err = b.fsm.getDB(uuid)
-				if err == nil {
-					err = db.Update(func(tx *bolt.Tx) error {
-						if tx.Bucket(dataBucketName) != nil {
-							if e := tx.DeleteBucket(dataBucketName); e != nil {
-								return e
-							}
-						}
-						if tx.Bucket(configBucketName) != nil {
-							return tx.DeleteBucket(configBucketName)
-						}
-						return nil
-					})
-					if err == nil {
-						err = b.fsm.closeDB(uuid)
-					}
+		/* // Old code to delete all buckets in the DB before closing and deleting
+		err = db.Update(func(tx *bolt.Tx) error {
+			if tx.Bucket(dataBucketName) != nil {
+				if e := tx.DeleteBucket(dataBucketName); e != nil {
+					return e
 				}
 			}
-		}
+			if tx.Bucket(configBucketName) != nil {
+				return tx.DeleteBucket(configBucketName)
+			}
+			return nil
+		})
+		*/
+
+		err = b.fsm.closeDBFile(uuid)
 	}
 
 	return err

@@ -458,7 +458,7 @@ func (ns *NamespaceStore) setNamespaceLocked(ctx context.Context, nsEntry *names
 	if err := ns.writeNamespace(ctx, storage, entry); err != nil {
 		return fmt.Errorf("failed to persist namespace: %w", err)
 	} else if ma, ok := ns.core.GetMountable(); ok { // PNPT: create mountable table for the new namespace.
-		if err := ma.CreateIfNotExists(ctx, entry.Path, entry.UUID); err != nil {
+		if err := ma.CreateMountView(ctx, namespaceBarrierPrefix, entry.UUID); err != nil {
 			return fmt.Errorf("failed to create mountable for namespace: %w", err)
 		}
 	}
@@ -941,7 +941,7 @@ func (ns *NamespaceStore) DeleteNamespace(ctx context.Context, path string) (str
 
 		// PNPT: drop the empty table for the deleted namespace
 		if ma, ok := ns.core.GetMountable(); ok {
-			err = ma.DropIfExists(ctx, namespaceToDelete.Path, namespaceToDelete.UUID)
+			err = ma.DeleteMountView(ctx, namespaceBarrierPrefix, namespaceToDelete.UUID)
 			if err != nil {
 				ns.logger.Error("failed to drop namespace from mountable", "namespace", namespaceToDelete.Path, "error", err.Error())
 			}

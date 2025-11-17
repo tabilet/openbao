@@ -8,8 +8,8 @@ import (
 )
 
 type Mountable interface {
-	CreateIfNotExists(ctx context.Context, path, uuid string) error
-	DropIfExists(ctx context.Context, path, uuid string) error
+	CreateMountView(ctx context.Context, prefix, uuid string) error
+	DeleteMountView(ctx context.Context, prefix, uuid string) error
 }
 
 // PhysicalToMountable verifies if a physical backend is also mountable

@@ -1,6 +1,22 @@
 // Copyright (c) HashiCorp, Inc.
 // SPDX-License-Identifier: MPL-2.0
 
+// Package raft implements the Raft physical storage backend for OpenBao.
+//
+// LOCK DESIGN:
+// This package uses a three-level lock hierarchy to ensure correctness and performance.
+// For complete documentation on the locking strategy, see LOCKS.md in this directory.
+//
+// Quick Reference:
+//   - FSM.l (sync.RWMutex): Protects FSM structure and database cache
+//   - RLock: Used for all read operations (high concurrency)
+//   - Lock: Used for structure modifications (exclusive)
+//   - Always acquire in order: semaphore → FSM lock → BoltDB transaction
+//
+// Key Patterns:
+//   - getDB(): Double-check locking for optimal cache performance
+//   - withDBView/withDBUpdate: Helper functions encapsulating lock + database access
+//   - ApplyBatch: Coarse-grained locking for batch consistency
 package raft
 
 import (
@@ -12,6 +28,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +45,7 @@ import (
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/physical"
 	"github.com/openbao/openbao/sdk/v2/plugin/pb"
+	"github.com/rboyer/safeio"
 	bolt "go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
 	"zgo.at/zcache/v2"
@@ -42,8 +61,13 @@ const (
 	beginTxOp
 	commitTxOp
 
-	chunkingPrefix   = "raftchunking/"
-	databaseFilename = "vault.db"
+	chunkingPrefix       = "raftchunking/"
+	databaseFilenameBase = "vault"
+	databaseFilenameExt  = ".db"
+
+	// File permissions for database files
+	dbFilePermissions      = 0o600
+	unwantedPermissionBits = 0o077
 )
 
 var (
@@ -125,7 +149,7 @@ type FSM struct {
 	applyCallback func()
 
 	dbCache *zcache.Cache[string, *bolt.DB]
-	//db *bolt.DB
+	// db *bolt.DB
 
 	// retoreCb is called after we've restored a snapshot
 	restoreCb restoreCallback
@@ -175,32 +199,61 @@ func NewFSM(path string, localID string, mEnabled bool, expire, cleanup time.Dur
 	})
 
 	f.dbCache = zcache.New[string, *bolt.DB](expire, cleanup)
-	_, err := f.getDB(databaseFilename)
+	_, err := f.getDB(databaseFilename())
 
 	return f, err
 }
 
-func (f *FSM) getBucketname(ctx context.Context) ([]byte, error) {
-	if !f.mEnabled || ctx == nil {
-		return dataBucketName, nil
+func (f *FSM) getDatabaseName(ctx context.Context) (string, error) {
+	if !f.mEnabled {
+		return databaseFilename(), nil
 	}
-
-	return getBucketname(ctx)
+	return getDatabaseName(ctx)
 }
 
-func (f *FSM) getBucketnameString(ctx context.Context) (string, error) {
-	name, err := f.getBucketname(ctx)
+// getDatabaseForContext retrieves the appropriate database for the given context.
+// This combines database name resolution and database retrieval into a single operation.
+func (f *FSM) getDatabaseForContext(ctx context.Context) (*bolt.DB, error) {
+	vaultDBName, err := f.getDatabaseName(ctx)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return string(name), nil
+	return f.getDB(vaultDBName)
+}
+
+// withDBView executes a read-only function against the database for the given context.
+// It handles database retrieval and locking automatically.
+func (f *FSM) withDBView(ctx context.Context, fn func(*bolt.DB) error) error {
+	db, err := f.getDatabaseForContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	f.l.RLock()
+	defer f.l.RUnlock()
+
+	return fn(db)
+}
+
+// withDBUpdate executes a read-write function against the database for the given context.
+// It handles database retrieval and locking automatically.
+func (f *FSM) withDBUpdate(ctx context.Context, fn func(*bolt.DB) error) error {
+	db, err := f.getDatabaseForContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	f.l.RLock()
+	defer f.l.RUnlock()
+
+	return fn(db)
 }
 
 func (f *FSM) getDB(filename string) (*bolt.DB, error) {
 	f.l.RLock()
-	defer f.l.RUnlock()
 
 	db, ok := f.dbCache.Get(filename)
+	f.l.RUnlock() // Release immediately after read
 	if ok {
 		return db, nil
 	}
@@ -208,15 +261,74 @@ func (f *FSM) getDB(filename string) (*bolt.DB, error) {
 	f.l.Lock()
 	defer f.l.Unlock()
 
+	// Double-check after acquiring write lock (race protection)
+	db, ok = f.dbCache.Get(filename)
+	if ok {
+		return db, nil
+	}
+
 	db, err := f.openDBFile(filename)
 	if err == nil {
-		if filename == databaseFilename {
+		if filename == databaseFilename() {
 			f.dbCache.SetWithExpire(filename, db, zcache.NoExpiration)
 		} else {
 			f.dbCache.Set(filename, db)
 		}
 	}
 	return db, err
+}
+
+// getAllDatabases returns a list of all database filenames in the FSM directory.
+// This includes the default database and all namespace-specific databases.
+// The returned list always has the default database first, followed by others in sorted order.
+func (f *FSM) getAllDatabases() ([]string, error) {
+	return f.findDatabasesInDir(f.path)
+}
+
+// findDatabasesInDir returns a list of all database filenames in the specified directory.
+// This is used both for the FSM directory and for snapshot directories.
+// The returned list always has the default database first, followed by others in sorted order.
+func (f *FSM) findDatabasesInDir(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read directory %s: %w", dir, err)
+	}
+
+	var databases []string
+	defaultDB := databaseFilename()
+	hasDefault := false
+
+	// Find all database files matching the pattern
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		// Check if file matches database pattern: vault*.db
+		if strings.HasPrefix(name, databaseFilenameBase) && strings.HasSuffix(name, databaseFilenameExt) {
+			if name == defaultDB {
+				hasDefault = true
+			} else {
+				databases = append(databases, name)
+			}
+		}
+	}
+
+	// Sort non-default databases for deterministic ordering
+	sort.Strings(databases)
+
+	// Always put default database first if it exists
+	if hasDefault {
+		databases = append([]string{defaultDB}, databases...)
+	}
+
+	// If no databases found, return at least the default
+	if len(databases) == 0 {
+		databases = []string{defaultDB}
+	}
+
+	return databases, nil
 }
 
 // SetFSMDelay adds a delay to the FSM apply. This is used in tests to simulate
@@ -241,18 +353,18 @@ func (f *FSM) openDBFile(filename string) (*bolt.DB, error) {
 	switch {
 	case err != nil && os.IsNotExist(err):
 	case err != nil:
-		return nil, fmt.Errorf("error checking raft FSM db file %q: %v", dbPath, err)
+		return nil, fmt.Errorf("error checking raft FSM db file %q: %w", dbPath, err)
 	default:
 		perms := st.Mode() & os.ModePerm
-		if perms&0o077 != 0 {
+		if perms&unwantedPermissionBits != 0 {
 			f.logger.Warn("raft FSM db file has wider permissions than needed",
-				"needed", os.FileMode(0o600), "existing", perms)
+				"needed", os.FileMode(dbFilePermissions), "existing", perms)
 		}
 	}
 
 	opts := boltOptions(dbPath)
 	start := time.Now()
-	boltDB, err := bolt.Open(dbPath, 0o600, opts)
+	boltDB, err := bolt.Open(dbPath, dbFilePermissions, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +413,7 @@ func (f *FSM) openDBFile(filename string) (*bolt.DB, error) {
 	return boltDB, err
 }
 
-func (f *FSM) closeDB(filename string) error {
+func (f *FSM) closeDBFile(filename string) error {
 	if len(filename) == 0 {
 		return errors.New("can not open empty filename")
 	}
@@ -315,6 +427,9 @@ func (f *FSM) closeDB(filename string) error {
 	return os.Remove(dbPath)
 }
 
+// Stats aggregates and returns bolt database statistics across all open
+// database files. This includes metrics for free pages, transactions, and
+// storage utilization.
 func (f *FSM) Stats() bolt.Stats {
 	f.l.RLock()
 	defer f.l.RUnlock()
@@ -401,7 +516,7 @@ func writeSnapshotMetaToDB(metadata *raft.SnapshotMeta, db *bolt.DB) error {
 
 func (f *FSM) localNodeConfig() (*LocalNodeConfigValue, error) {
 	var configBytes []byte
-	dbDefault, err := f.getDB(databaseFilename)
+	dbDefault, err := f.getDB(databaseFilename())
 	if err != nil {
 		return nil, err
 	}
@@ -516,7 +631,7 @@ func (f *FSM) persistDesiredSuffrage(lnconfig *LocalNodeConfigValue) error {
 		return err
 	}
 
-	dbDefault, err := f.getDB(databaseFilename)
+	dbDefault, err := f.getDB(databaseFilename())
 	if err != nil {
 		return err
 	}
@@ -529,7 +644,7 @@ func (f *FSM) witnessSnapshot(metadata *raft.SnapshotMeta) error {
 	f.l.RLock()
 	defer f.l.RUnlock()
 
-	dbDefault, err := f.getDB(databaseFilename)
+	dbDefault, err := f.getDB(databaseFilename())
 	if err == nil {
 		err = writeSnapshotMetaToDB(metadata, dbDefault)
 	}
@@ -553,90 +668,59 @@ func (f *FSM) LatestState() (*IndexValue, *ConfigurationValue) {
 	}, f.latestConfig.Load().(*ConfigurationValue)
 }
 
-// Delete deletes the given key from the bolt file.
+// Delete deletes the given key from the bolt database.
 func (f *FSM) Delete(ctx context.Context, path string) error {
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "delete"}, time.Now())
 
-	var db *bolt.DB
-	bucketName, err := f.getBucketname(ctx)
-	if err == nil {
-		db, err = f.getDB(string(bucketName))
-	}
-	if err != nil {
-		return err
-	}
-
-	f.l.RLock()
-	defer f.l.RUnlock()
-
-	return db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(dataBucketName).Delete([]byte(path))
+	return f.withDBUpdate(ctx, func(db *bolt.DB) error {
+		return db.Update(func(tx *bolt.Tx) error {
+			return tx.Bucket(dataBucketName).Delete([]byte(path))
+		})
 	})
 }
 
-// Delete deletes the given key from the bolt file.
+// DeletePrefix removes all keys with the specified prefix from the bolt database.
 func (f *FSM) DeletePrefix(ctx context.Context, prefix string) error {
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "delete_prefix"}, time.Now())
 
-	var db *bolt.DB
-	bucketName, err := f.getBucketname(ctx)
-	if err == nil {
-		db, err = f.getDB(string(bucketName))
-	}
-	if err != nil {
-		return err
-	}
+	return f.withDBUpdate(ctx, func(db *bolt.DB) error {
+		return db.Update(func(tx *bolt.Tx) error {
+			// Assume bucket exists and has keys
+			c := tx.Bucket(dataBucketName).Cursor()
 
-	f.l.RLock()
-	defer f.l.RUnlock()
-
-	err = db.Update(func(tx *bolt.Tx) error {
-		// Assume bucket exists and has keys
-		c := tx.Bucket(dataBucketName).Cursor()
-
-		prefixBytes := []byte(prefix)
-		for k, _ := c.Seek(prefixBytes); k != nil && bytes.HasPrefix(k, prefixBytes); k, _ = c.Next() {
-			if err := c.Delete(); err != nil {
-				return err
+			prefixBytes := []byte(prefix)
+			for k, _ := c.Seek(prefixBytes); k != nil && bytes.HasPrefix(k, prefixBytes); k, _ = c.Next() {
+				if err := c.Delete(); err != nil {
+					return err
+				}
 			}
-		}
 
-		return nil
+			return nil
+		})
 	})
-
-	return err
 }
 
-// Get retrieves the value at the given path from the bolt file.
+// Get retrieves the value at the given path from the bolt database.
 func (f *FSM) Get(ctx context.Context, path string) (*physical.Entry, error) {
-	// TODO: Remove this outdated metric name in an older release
+	// TODO(v2.0): Remove deprecated "raft" metric namespace in a future release.
+	// The "raft_storage" namespace should be used instead.
 	defer metrics.MeasureSince([]string{"raft", "get"}, time.Now())
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "get"}, time.Now())
-
-	var db *bolt.DB
-	bucketName, err := f.getBucketname(ctx)
-	if err == nil {
-		db, err = f.getDB(string(bucketName))
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	f.l.RLock()
-	defer f.l.RUnlock()
 
 	var valCopy []byte
 	var found bool
 
-	err = db.View(func(tx *bolt.Tx) error {
-		value := tx.Bucket(dataBucketName).Get([]byte(path))
-		if value != nil {
-			found = true
-			valCopy = make([]byte, len(value))
-			copy(valCopy, value)
-		}
+	err := f.withDBView(ctx, func(db *bolt.DB) error {
+		return db.View(func(tx *bolt.Tx) error {
+			value := tx.Bucket(dataBucketName).Get([]byte(path))
+			if value != nil {
+				found = true
+				valCopy = make([]byte, len(value))
+				copy(valCopy, value)
+			}
 
-		return nil
+			return nil
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -651,25 +735,14 @@ func (f *FSM) Get(ctx context.Context, path string) (*physical.Entry, error) {
 	}, nil
 }
 
-// Put writes the given entry to the bolt file.
+// Put writes the given entry to the bolt database.
 func (f *FSM) Put(ctx context.Context, entry *physical.Entry) error {
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "put"}, time.Now())
 
-	var db *bolt.DB
-	bucketName, err := f.getBucketname(ctx)
-	if err == nil {
-		db, err = f.getDB(string(bucketName))
-	}
-	if err != nil {
-		return err
-	}
-
-	f.l.RLock()
-	defer f.l.RUnlock()
-
-	// Start a write transaction.
-	return db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(dataBucketName).Put([]byte(entry.Key), entry.Value)
+	return f.withDBUpdate(ctx, func(db *bolt.DB) error {
+		return db.Update(func(tx *bolt.Tx) error {
+			return tx.Bucket(dataBucketName).Put([]byte(entry.Key), entry.Value)
+		})
 	})
 }
 
@@ -678,34 +751,21 @@ func (f *FSM) List(ctx context.Context, prefix string) ([]string, error) {
 	return f.ListPage(ctx, prefix, "", -1)
 }
 
-// ListPage retrieves the set of keys with the given prefix from the bolt
-// file, after the specified entry (if present), and up to the given
-// limit of entries.
+// ListPage retrieves the set of keys with the given prefix from the bolt database,
+// after the specified entry (if present), and up to the given limit of entries.
 func (f *FSM) ListPage(ctx context.Context, prefix string, after string, limit int) ([]string, error) {
-	// TODO: Remove this outdated metric name in a future release
+	// TODO(v2.0): Remove deprecated "raft" metric namespace in a future release.
+	// The "raft_storage" namespace should be used instead.
 	defer metrics.MeasureSince([]string{"raft", "list"}, time.Now())
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "list"}, time.Now())
 
-	var db *bolt.DB
-	bucketName, err := f.getBucketname(ctx)
-	if err == nil {
-		db, err = f.getDB(string(bucketName))
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	f.l.RLock()
-	defer f.l.RUnlock()
-
 	var keys []string
-	err = db.View(func(tx *bolt.Tx) error {
-		keys, err = listPageInner(ctx, tx.Bucket(dataBucketName), prefix, after, limit)
-		if err != nil {
+	err := f.withDBView(ctx, func(db *bolt.DB) error {
+		return db.View(func(tx *bolt.Tx) error {
+			var err error
+			keys, err = listPageInner(ctx, tx.Bucket(dataBucketName), prefix, after, limit)
 			return err
-		}
-
-		return nil
+		})
 	})
 
 	return keys, err
@@ -766,7 +826,16 @@ func listPageInner(ctx context.Context, b *bolt.Bucket, prefix string, after str
 	return keys, nil
 }
 
-// Within ApplyBatch, applies non-transactional operations.
+// logUnknownOpType logs a warning for an unknown operation type.
+// It ensures each unknown type is only logged once using a sync.Map.
+func (f *FSM) logUnknownOpType(opType uint32) {
+	if _, ok := f.unknownOpTypes.Load(opType); !ok {
+		f.logger.Error("unsupported transaction operation", "op", opType)
+		f.unknownOpTypes.Store(opType, struct{}{})
+	}
+}
+
+// applyBatchNonTxOps applies non-transactional operations within ApplyBatch.
 func (f *FSM) applyBatchNonTxOps(b *bolt.Bucket, txnState *fsmTxnCommitIndexApplicationState, command *LogData) error {
 	for _, op := range command.Operations {
 		var err error
@@ -790,10 +859,7 @@ func (f *FSM) applyBatchNonTxOps(b *bolt.Bucket, txnState *fsmTxnCommitIndexAppl
 				go f.restoreCb(context.Background())
 			}
 		default:
-			if _, ok := f.unknownOpTypes.Load(op.OpType); !ok {
-				f.logger.Error("unsupported transaction operation", "op", op.OpType)
-				f.unknownOpTypes.Store(op.OpType, struct{}{})
-			}
+			f.logUnknownOpType(op.OpType)
 		}
 
 		if err != nil {
@@ -804,8 +870,8 @@ func (f *FSM) applyBatchNonTxOps(b *bolt.Bucket, txnState *fsmTxnCommitIndexAppl
 	return nil
 }
 
-// Within ApplyBatch, applies a transaction within the broader context of the
-// batch's transaction.
+// applyBatchTxOps applies a transaction within the broader context of the batch's transaction.
+// It first verifies all operations can apply correctly before performing any writes.
 func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommitIndexApplicationState, command *LogData) error {
 	txnState.setInTx()
 
@@ -841,10 +907,7 @@ func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommi
 		case verifyListOp:
 			err = txnState.doVerifyList(tx, b, op)
 		default:
-			if _, ok := f.unknownOpTypes.Load(op.OpType); !ok {
-				f.logger.Error("unsupported transaction operation", "op", op.OpType)
-				f.unknownOpTypes.Store(op.OpType, struct{}{})
-			}
+			f.logUnknownOpType(op.OpType)
 		}
 
 		if err != nil {
@@ -868,10 +931,7 @@ func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommi
 		case verifyListOp:
 			// ignore
 		default:
-			if _, ok := f.unknownOpTypes.Load(op.OpType); !ok {
-				f.logger.Error("unsupported transaction operation", "op", op.OpType)
-				f.unknownOpTypes.Store(op.OpType, struct{}{})
-			}
+			f.logUnknownOpType(op.OpType)
 		}
 
 		if err != nil {
@@ -966,7 +1026,7 @@ func (f *FSM) ApplyBatchOld(logs []*raft.Log) []interface{} {
 	// Hence, keep the original upstream ordering of Update w.r.t. batch
 	// application and switch to pre-verifying transactions prior tok,
 	// performing any writes in them.
-	dbDefault, err := f.getDB(databaseFilename)
+	dbDefault, err := f.getDB(databaseFilename())
 	if err != nil {
 		f.logger.Error("failed to get default database", "error", err)
 		panic("failed to get default database")
@@ -1081,9 +1141,9 @@ func (f *FSM) ApplyBatchOld(logs []*raft.Log) []interface{} {
 }
 
 // this is copied from the latest branch 0dcb577 before "Improve raft transaction application performance (#634)"
-// ApplyBatch will apply a set of logs to the FSM. This is called from the raft
+// ApplyBatchTry will apply a set of logs to the FSM. This is called from the raft
 // library.
-func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
+func (f *FSM) ApplyBatchTry(logs []*raft.Log) []interface{} {
 	numLogs := len(logs)
 
 	if numLogs == 0 {
@@ -1100,7 +1160,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	var latestConfiguration *ConfigurationValue
 	commands := make([]interface{}, 0, numLogs)
 	for i, l := range logs {
-		bucketName := string(dataBucketName)
+		vaultDBName := databaseFilename()
 		switch l.Type {
 		case raft.LogCommand:
 			command := &LogData{}
@@ -1111,7 +1171,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			}
 			commands[i] = command
 			if command.BucketName != nil {
-				bucketName = *command.BucketName
+				vaultDBName = *command.BucketName
 			}
 		case raft.LogConfiguration:
 			configuration := raft.DecodeConfiguration(l.Data)
@@ -1125,12 +1185,12 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		default:
 			panic(fmt.Sprintf("got unexpected log type: %d", l.Type))
 		}
-		db, err := f.getDB(bucketName)
+		db, err := f.getDB(vaultDBName)
 		if err != nil {
-			f.logger.Error("unable to get db", "error", err, "bucket", bucketName)
+			f.logger.Error("unable to get db", "error", err, "bucket", vaultDBName)
 			panic("unable to get db")
 		}
-		dbName[i] = bucketName
+		dbName[i] = vaultDBName
 		dbList[i] = db
 	}
 	// Only advance latest pointer if this log has a higher index value than
@@ -1236,7 +1296,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 
 	if err == nil {
 		var db *bolt.DB
-		db, err = f.getDB(databaseFilename)
+		db, err = f.getDB(databaseFilename())
 		if err == nil {
 			err = db.Update(func(tx *bolt.Tx) error {
 				if len(logIndex) > 0 {
@@ -1250,6 +1310,248 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 				return nil
 			})
 		}
+	}
+
+	if err != nil {
+		f.logger.Error("failed to store data", "error", err)
+		panic("failed to store data")
+	}
+
+	if lowestActiveIndex != nil {
+		f.fastTxnTracker.clearOldEntries(*lowestActiveIndex)
+	}
+
+	// If we advanced the latest value, update the in-memory representation too.
+	if len(logIndex) > 0 {
+		atomic.StoreUint64(f.latestTerm, lastLog.Term)
+		atomic.StoreUint64(f.latestIndex, lastLog.Index)
+	}
+
+	// If one or more configuration changes were processed, store the latest one.
+	if latestConfiguration != nil {
+		f.latestConfig.Store(latestConfiguration)
+	}
+
+	// Build the responses. The logs array is used here to ensure we reply to
+	// all command values; even if they are not of the types we expect. This
+	// should futureproof this function from more log types being provided.
+	resp := make([]interface{}, numLogs)
+	for i := range logs {
+		resp[i] = &FSMApplyResponse{
+			Success:    true,
+			EntrySlice: entrySlices[i],
+		}
+	}
+
+	return resp
+}
+
+// ApplyBatch combines multi-database support from ApplyBatchTry with the single
+// transaction pattern from ApplyBatchOld. It groups commands by database and
+// executes one transaction per unique database, rather than one transaction per
+// command or one transaction for all commands.
+func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
+	numLogs := len(logs)
+
+	if numLogs == 0 {
+		return []interface{}{}
+	}
+
+	dbList := make([]*bolt.DB, numLogs)
+	dbName := make([]string, numLogs)
+
+	// We will construct one slice per log, each slice containing another slice of results from our get ops
+	entrySlices := make([][]*FSMEntry, 0, numLogs)
+
+	// Do the unmarshalling first so we don't hold locks
+	var latestConfiguration *ConfigurationValue
+	commands := make([]interface{}, 0, numLogs)
+	for i, l := range logs {
+		vaultDBName := databaseFilename()
+		switch l.Type {
+		case raft.LogCommand:
+			command := &LogData{}
+			err := proto.Unmarshal(l.Data, command)
+			if err != nil {
+				f.logger.Error("error proto unmarshaling log data", "error", err)
+				panic("error proto unmarshaling log data")
+			}
+			commands = append(commands, command)
+			if command.BucketName != nil {
+				vaultDBName = *command.BucketName
+			}
+		case raft.LogConfiguration:
+			configuration := raft.DecodeConfiguration(l.Data)
+			config := raftConfigurationToProtoConfiguration(l.Index, configuration)
+
+			commands = append(commands, config)
+
+			// Update the latest configuration the fsm has received; we will
+			// store this after it has been committed to storage.
+			latestConfiguration = config
+		default:
+			panic(fmt.Sprintf("got unexpected log type: %d", l.Type))
+		}
+		db, err := f.getDB(vaultDBName)
+		if err != nil {
+			f.logger.Error("unable to get db", "error", err, "bucket", vaultDBName)
+			panic("unable to get db")
+		}
+		dbName[i] = vaultDBName
+		dbList[i] = db
+	}
+
+	// Only advance latest pointer if this log has a higher index value than
+	// what we have seen in the past.
+	var logIndex []byte
+	var err error
+	latestIndex, _ := f.LatestState()
+	lastLog := logs[numLogs-1]
+	if latestIndex.Index < lastLog.Index {
+		logIndex, err = proto.Marshal(&IndexValue{
+			Term:  lastLog.Term,
+			Index: lastLog.Index,
+		})
+		if err != nil {
+			f.logger.Error("unable to marshal latest index", "error", err)
+			panic("unable to marshal latest index")
+		}
+	}
+
+	latestIndexAtomic := atomic.LoadUint64(f.latestIndex)
+
+	var lowestActiveIndex *uint64
+
+	f.l.RLock()
+	defer f.l.RUnlock()
+
+	if f.applyCallback != nil {
+		f.applyCallback()
+	}
+
+	// Group commands by database for efficient batch processing.
+	// Use a single transaction per unique database (like ApplyBatchOld),
+	// but support multiple databases (like ApplyBatch).
+	type dbCommandGroup struct {
+		db           *bolt.DB
+		dbName       string
+		commandInfos []struct {
+			index      int
+			commandRaw interface{}
+			log        *raft.Log
+		}
+	}
+
+	// Build groups of commands per database
+	dbGroups := make(map[string]*dbCommandGroup)
+	for commandIndex, commandRaw := range commands {
+		dbNameKey := dbName[commandIndex]
+		if _, exists := dbGroups[dbNameKey]; !exists {
+			dbGroups[dbNameKey] = &dbCommandGroup{
+				db:     dbList[commandIndex],
+				dbName: dbNameKey,
+				commandInfos: make([]struct {
+					index      int
+					commandRaw interface{}
+					log        *raft.Log
+				}, 0),
+			}
+		}
+		dbGroups[dbNameKey].commandInfos = append(dbGroups[dbNameKey].commandInfos, struct {
+			index      int
+			commandRaw interface{}
+			log        *raft.Log
+		}{
+			index:      commandIndex,
+			commandRaw: commandRaw,
+			log:        logs[commandIndex],
+		})
+	}
+
+	// Initialize entry slices for all commands
+	for i := 0; i < numLogs; i++ {
+		entrySlices = append(entrySlices, make([]*FSMEntry, 0))
+	}
+
+	// Process each database group with a single transaction
+	for _, group := range dbGroups {
+		err = group.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket(dataBucketName)
+			configB := tx.Bucket(configBucketName)
+
+			for _, cmdInfo := range group.commandInfos {
+				switch command := cmdInfo.commandRaw.(type) {
+				case *LogData:
+					txnState := f.fastTxnTracker.applyState(latestIndexAtomic, cmdInfo.index, cmdInfo.log.Index)
+					if len(command.Operations) == 0 || command.Operations[0].OpType != beginTxOp {
+						err = f.applyBatchNonTxOps(b, txnState, command)
+					} else {
+						err = f.applyBatchTxOps(tx, b, txnState, command)
+					}
+
+					if command.LowestActiveIndex != nil {
+						lowestActiveIndex = command.LowestActiveIndex
+					}
+
+					if err != nil {
+						// If we're in a transaction, we do not want to err the
+						// global db.Update call unless this is a critical error
+						// worthy of a panic(...).
+						//
+						// Create a special FSMEntry to send back the error
+						// message, that applyLog(...) will look for if it
+						// sent a transaction.
+						if txnState.getInTx() && errors.Is(err, physical.ErrTransactionCommitFailure) {
+							entrySlices[cmdInfo.index] = append(entrySlices[cmdInfo.index], &FSMEntry{
+								Key:   fsmEntryTxErrorKey,
+								Value: []byte(err.Error()),
+							})
+
+							// Process other events; this transaction failure was handled
+							// appropriately already in applyBatchTxOps.
+							err = nil
+						}
+					}
+				case *ConfigurationValue:
+					configBytes, err := proto.Marshal(command)
+					if err != nil {
+						return err
+					}
+					if err := configB.Put(latestConfigKey, configBytes); err != nil {
+						return err
+					}
+				}
+
+				if err != nil {
+					return err
+				}
+			}
+
+			return nil
+		})
+		if err != nil {
+			break
+		}
+	}
+
+	// If we had no error, update our last applied log in the default database.
+	if err == nil {
+		dbDefault, getErr := f.getDB(databaseFilename())
+		if getErr != nil {
+			f.logger.Error("failed to get default database", "error", getErr)
+			panic("failed to get default database")
+		}
+		err = dbDefault.Update(func(tx *bolt.Tx) error {
+			if len(logIndex) > 0 {
+				b := tx.Bucket(configBucketName)
+				err = b.Put(latestIndexKey, logIndex)
+				if err != nil {
+					return err
+				}
+			}
+
+			return nil
+		})
 	}
 
 	if err != nil {
@@ -1301,56 +1603,95 @@ type writeErrorCloser interface {
 // twice, once for use in determining various metadata attributes of the dataset
 // (size, checksum, etc) and a second for the sink of the data. We also use a
 // proto delimited writer so we can stream proto messages to the sink.
+//
+// For multi-database mode, this function iterates through all databases and
+// writes them to the snapshot. Database boundaries are marked with special
+// marker entries using the __DATABASE__: prefix.
 func (f *FSM) writeTo(ctx context.Context, metaSink writeErrorCloser, sink writeErrorCloser) {
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "write_snapshot"}, time.Now())
 
 	protoWriter := NewDelimitedWriter(sink)
 	metadataProtoWriter := NewDelimitedWriter(metaSink)
 
-	var db *bolt.DB
-	bucketName, err := f.getBucketname(ctx)
-	if err == nil {
-		db, err = f.getDB(string(bucketName))
-	}
+	// Get all databases to snapshot
+	dbNames, err := f.getAllDatabases()
 	if err != nil {
 		sink.CloseWithError(err)
+		metaSink.CloseWithError(err)
 		return
 	}
 
 	f.l.RLock()
 	defer f.l.RUnlock()
 
-	err = db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(dataBucketName)
-		c := b.Cursor()
-
-		// Do the first scan of the data for metadata purposes.
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			err := metadataProtoWriter.WriteMsg(&pb.StorageEntry{
-				Key:   string(k),
-				Value: v,
-			})
-			if err != nil {
-				metaSink.CloseWithError(err)
-				return err
-			}
-		}
-		metaSink.Close()
-
-		// Do the second scan for copy purposes.
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			err := protoWriter.WriteMsg(&pb.StorageEntry{
-				Key:   string(k),
-				Value: v,
-			})
-			if err != nil {
-				return err
-			}
+	// Iterate through all databases
+	for _, dbName := range dbNames {
+		db, err := f.getDB(dbName)
+		if err != nil {
+			sink.CloseWithError(err)
+			metaSink.CloseWithError(err)
+			return
 		}
 
-		return nil
-	})
-	sink.CloseWithError(err)
+		// Write database marker to both sinks
+		markerKey := "__DATABASE__:" + dbName
+		markerEntry := &pb.StorageEntry{
+			Key:   markerKey,
+			Value: []byte(dbName),
+		}
+
+		if err := metadataProtoWriter.WriteMsg(markerEntry); err != nil {
+			metaSink.CloseWithError(err)
+			return
+		}
+
+		if err := protoWriter.WriteMsg(markerEntry); err != nil {
+			sink.CloseWithError(err)
+			return
+		}
+
+		// Write all entries from this database
+		err = db.View(func(tx *bolt.Tx) error {
+			b := tx.Bucket(dataBucketName)
+			if b == nil {
+				// Empty database, skip
+				return nil
+			}
+			c := b.Cursor()
+
+			// Do the first scan of the data for metadata purposes.
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				err := metadataProtoWriter.WriteMsg(&pb.StorageEntry{
+					Key:   string(k),
+					Value: v,
+				})
+				if err != nil {
+					return err
+				}
+			}
+
+			// Do the second scan for copy purposes.
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				err := protoWriter.WriteMsg(&pb.StorageEntry{
+					Key:   string(k),
+					Value: v,
+				})
+				if err != nil {
+					return err
+				}
+			}
+
+			return nil
+		})
+		if err != nil {
+			sink.CloseWithError(err)
+			metaSink.CloseWithError(err)
+			return
+		}
+	}
+
+	metaSink.Close()
+	sink.CloseWithError(nil)
 }
 
 // Snapshot implements the FSM interface. It returns a noop snapshot object.
@@ -1370,8 +1711,11 @@ func (f *FSM) SetNoopRestore(enabled bool) {
 }
 
 // Restore installs a new snapshot from the provided reader. It does an atomic
-// rename of the snapshot file into the database filepath. While a restore is
+// rename of the snapshot file(s) into the database filepath(s). While a restore is
 // happening the FSM is locked and no writes or reads can be performed.
+//
+// For multi-database mode, this function installs all database files from the
+// snapshot directory.
 func (f *FSM) Restore(r io.ReadCloser) error {
 	defer metrics.MeasureSince([]string{"raft_storage", "fsm", "restore_snapshot"}, time.Now())
 
@@ -1392,44 +1736,87 @@ func (f *FSM) Restore(r io.ReadCloser) error {
 		}
 	}
 
-	dbDefault, err := f.getDB(databaseFilename)
-	if err != nil {
-		return err
-	}
-
 	f.l.Lock()
 	defer f.l.Unlock()
 
-	// Cache the local node config before closing the db file
 	lnConfig, err := f.localNodeConfig()
 	if err != nil {
 		return err
 	}
 
-	// Close the db file
-	if err := dbDefault.Close(); err != nil {
-		f.logger.Error("failed to close database file", "error", err)
-		return err
+	// Close ALL currently open databases
+	f.logger.Info("closing all open databases for snapshot restore")
+	var closeErrors []error
+	currentDBs, err := f.getAllDatabases()
+	if err != nil {
+		f.logger.Warn("failed to get all databases, closing default only", "error", err)
+		currentDBs = []string{databaseFilename()}
 	}
 
-	dbPath := filepath.Join(f.path, databaseFilename)
+	for _, dbName := range currentDBs {
+		db, ok := f.dbCache.Get(dbName)
+		if ok && db != nil {
+			if closeErr := db.Close(); closeErr != nil {
+				f.logger.Error("failed to close database", "database", dbName, "error", closeErr)
+				closeErrors = append(closeErrors, closeErr)
+			} else {
+				f.logger.Debug("closed database", "database", dbName)
+			}
+		}
+	}
+
+	// Clear the database cache
+	f.dbCache.DeleteAll()
 
 	f.logger.Info("installing snapshot to FSM")
 
-	// Install the new boltdb file
-	var retErr *multierror.Error
-	if err := snapshotInstaller.Install(dbPath); err != nil {
-		f.logger.Error("failed to install snapshot", "error", err)
-		retErr = multierror.Append(retErr, fmt.Errorf("failed to install snapshot database: %w", err))
-	} else {
-		f.logger.Info("snapshot installed")
+	// Find all database files in the snapshot directory
+	snapshotDir := filepath.Dir(snapshotInstaller.filename)
+	snapshotDBs, err := f.findDatabasesInDir(snapshotDir)
+	if err != nil {
+		f.logger.Error("failed to find databases in snapshot", "error", err)
+		return fmt.Errorf("failed to find databases in snapshot: %w", err)
 	}
 
-	// Open the db file. We want to do this regardless of if the above install
-	// worked. If the install failed we should try to open the old DB file.
-	if _, err := f.openDBFile(databaseFilename); err != nil {
-		f.logger.Error("failed to open new database file", "error", err)
-		retErr = multierror.Append(retErr, fmt.Errorf("failed to open new bolt file: %w", err))
+	if len(snapshotDBs) == 0 {
+		f.logger.Warn("no database files found in snapshot, falling back to single database restore")
+		snapshotDBs = []string{databaseFilename()}
+	}
+
+	f.logger.Info("found databases in snapshot", "count", len(snapshotDBs), "databases", snapshotDBs)
+
+	// Install all database files
+	var retErr *multierror.Error
+	for _, dbName := range snapshotDBs {
+		srcPath := filepath.Join(snapshotDir, dbName)
+		dstPath := filepath.Join(f.path, dbName)
+
+		f.logger.Info("installing database", "database", dbName, "from", srcPath, "to", dstPath)
+
+		var installErr error
+		if runtime.GOOS != "windows" {
+			installErr = safeio.Rename(srcPath, dstPath)
+		} else {
+			installErr = os.Rename(srcPath, dstPath)
+		}
+
+		if installErr != nil {
+			f.logger.Error("failed to install database", "database", dbName, "error", installErr)
+			retErr = multierror.Append(retErr, fmt.Errorf("failed to install database %s: %w", dbName, installErr))
+		} else {
+			f.logger.Info("installed database", "database", dbName)
+		}
+	}
+
+	// Reopen all installed databases
+	f.logger.Info("reopening all databases")
+	for _, dbName := range snapshotDBs {
+		if _, err := f.openDBFile(dbName); err != nil {
+			f.logger.Error("failed to open database file", "database", dbName, "error", err)
+			retErr = multierror.Append(retErr, fmt.Errorf("failed to open database %s: %w", dbName, err))
+		} else {
+			f.logger.Info("reopened database", "database", dbName)
+		}
 	}
 
 	// Handle local node config restore. lnConfig should not be nil here, but
@@ -1528,11 +1915,7 @@ func (f *FSMChunkStorage) StoreChunk(chunk *raftchunking.ChunkInfo) (bool, error
 		Value: b,
 	}
 
-	var db *bolt.DB
-	bucketName, err := f.f.getBucketname(f.ctx)
-	if err == nil {
-		db, err = f.f.getDB(string(bucketName))
-	}
+	db, err := f.f.getDatabaseForContext(f.ctx)
 	if err != nil {
 		return false, err
 	}

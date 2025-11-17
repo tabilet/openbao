@@ -159,6 +159,12 @@ func (t *PostgreSQLBackendTransaction) List(ctx context.Context, prefix string) 
 
 	var keys []string
 	for rows.Next() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		var key string
 		err = rows.Scan(&key)
 		if err != nil {
@@ -166,6 +172,9 @@ func (t *PostgreSQLBackendTransaction) List(ctx context.Context, prefix string) 
 		}
 
 		keys = append(keys, key)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error: %w", err)
 	}
 
 	return keys, nil
@@ -198,6 +207,12 @@ func (t *PostgreSQLBackendTransaction) ListPage(ctx context.Context, prefix stri
 
 	var keys []string
 	for rows.Next() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		var key string
 		err = rows.Scan(&key)
 		if err != nil {
@@ -205,6 +220,9 @@ func (t *PostgreSQLBackendTransaction) ListPage(ctx context.Context, prefix stri
 		}
 
 		keys = append(keys, key)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error: %w", err)
 	}
 
 	return keys, nil

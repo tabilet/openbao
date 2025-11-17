@@ -34,7 +34,7 @@ func TestPostgreSQLBackend(t *testing.T) {
 
 	table := os.Getenv("PGTABLE")
 	if table == "" {
-		table = "openbao_kv_store"
+		table = "openbaoKVStore"
 	}
 
 	hae := os.Getenv("PGHAENABLED")
@@ -404,7 +404,7 @@ func TestPostgreSQLBackend_CreateTables(t *testing.T) {
 
 	b, err := NewPostgreSQLBackend(map[string]string{
 		"connection_url": connURL,
-		"table":          "openbao_kv_store",
+		"table":          openbaoKVStore,
 		"ha_enabled":     "true",
 	}, logger)
 	if err != nil {
@@ -427,7 +427,7 @@ func TestPostgreSQLBackend_NoCreateTables(t *testing.T) {
 
 	b, err := NewPostgreSQLBackend(map[string]string{
 		"connection_url":    connURL,
-		"table":             "openbao_kv_store",
+		"table":             "openbaoKVStore",
 		"ha_enabled":        "true",
 		"skip_create_table": "true",
 	}, logger)
@@ -482,7 +482,7 @@ func TestPostgreSQLBackend_PGEnv(t *testing.T) {
 	os.Setenv("PGSSLMODE", "disable")
 
 	_, err = NewPostgreSQLBackend(map[string]string{
-		"table":             "openbao_kv_store",
+		"table":             openbaoKVStore,
 		"ha_enabled":        "true",
 		"skip_create_table": "true",
 	}, logger)
@@ -508,7 +508,7 @@ func TestPostgreSQLBackend_Retry(t *testing.T) {
 
 	b, err = NewPostgreSQLBackend(map[string]string{
 		"connection_url":      connURL,
-		"table":               "openbao_kv_store",
+		"table":               "openbaoKVStore",
 		"ha_enabled":          "true",
 		"max_connect_retries": "1000",
 		"skip_create_table":   "true",
@@ -532,7 +532,7 @@ func TestPostgreSQLBackend_Parallel(t *testing.T) {
 
 	bRaw, err := NewPostgreSQLBackend(map[string]string{
 		"connection_url": connURL,
-		"table":          "openbao_kv_store",
+		"table":          openbaoKVStore,
 		"ha_enabled":     "true",
 		"max_parallel":   "2",
 	}, logger)

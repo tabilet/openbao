@@ -5,6 +5,7 @@ package postgresql
 
 import (
 	"context"
+	"crypto/md5"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -38,6 +39,8 @@ const (
 	// PostgreSQLLockRetryInterval is the amount of time to wait
 	// if a lock fails before trying again.
 	PostgreSQLLockRetryInterval = time.Second
+
+	openbaoKVStore = "openbao_kv_store"
 )
 
 // Verify PostgreSQLBackend satisfies the correct interfaces
@@ -105,7 +108,7 @@ func NewPostgreSQLBackend(conf map[string]string, logger log.Logger) (physical.B
 
 	unquoted_table, ok := conf["table"]
 	if !ok {
-		unquoted_table = "openbao_kv_store"
+		unquoted_table = openbaoKVStore
 	}
 	quoted_table := dbutil.QuoteIdentifier(unquoted_table)
 
@@ -352,23 +355,23 @@ func (m *PostgreSQLBackend) getTablename(ctx context.Context) (string, error) {
 // getTableUUID returns quoted table name from uuid
 func getTableUUID(uuid string) string {
 	if uuid == namespace.RootNamespaceUUID {
-		return dbutil.QuoteIdentifier("openbao_kv_store")
+		return dbutil.QuoteIdentifier(openbaoKVStore)
 	}
 
-	return dbutil.QuoteIdentifier(uuid)
+	return dbutil.QuoteIdentifier(fmt.Sprintf("%s_v_%x", openbaoKVStore, md5.Sum([]byte(uuid))))
 }
 
 // existingTable checks if the given quoted table name exists in the database
 func (m *PostgreSQLBackend) existingTable(tname string) (bool, error) {
 	n := len(tname)
-	x := `'` + tname[1:n-1] + `'`
-	statement := `SELECT 1 FROM information_schema.tables WHERE table_name = ` + x + ` AND table_catalog = 'openbao'`
-	return m.existing(statement)
+	x := tname[1 : n-1]
+	statement := `SELECT 1 FROM information_schema.tables WHERE table_name = $1 AND table_catalog = 'openbao'`
+	return m.existing(statement, x)
 }
 
 // existing checks if the given SQL statement returns any rows, indicating that the table exists.
-func (m *PostgreSQLBackend) existing(statement string) (bool, error) {
-	tableRows, err := m.client.Query(statement)
+func (m *PostgreSQLBackend) existing(statement string, args ...any) (bool, error) {
+	tableRows, err := m.client.Query(statement, args...)
 	if err != nil {
 		m.logger.Error("failed to check if table exists", "statement", statement, "error", err)
 		return false, err
@@ -377,23 +380,10 @@ func (m *PostgreSQLBackend) existing(statement string) (bool, error) {
 	return tableRows.Next(), nil
 }
 
-// CreateIfNotExists creates the table if it does not exist.
-func (m *PostgreSQLBackend) CreateIfNotExists(ctx context.Context, _, uuid string) error {
+// CreateMountView creates the table if it does not exist.
+func (m *PostgreSQLBackend) CreateMountView(ctx context.Context, prefix, uuid string) error {
 	if !m.mEnabled {
 		return nil
-	}
-
-	parent, err := m.getTablename(ctx)
-	if err != nil {
-		return err
-	}
-	parentExist, err := m.existingTable(parent)
-	if err != nil {
-		m.logger.Error("check parent table exists", "parent", parent, "error", err)
-		return err
-	} else if !parentExist {
-		m.logger.Error("parent namespace not found", "parent", parent)
-		return fmt.Errorf("parent namespace not found: %s", parent)
 	}
 
 	return m.createTables(getTableUUID(uuid))
@@ -409,6 +399,14 @@ func (m *PostgreSQLBackend) createTables(mtable string, hatable ...string) error
 
 	defer txn.Rollback()
 
+	error23505 := func(err error, obj string) bool {
+		if err != nil && strings.Contains(err.Error(), "SQLSTATE 23505") {
+			m.logger.Warn("Skipping creation as other processes have already created the "+obj, "err", err)
+			return true
+		}
+		return false
+	}
+
 	createTableQuery := "CREATE TABLE IF NOT EXISTS " + mtable + " (" +
 		`parent_path TEXT COLLATE "C" NOT NULL,` +
 		`  path        TEXT COLLATE "C",` +
@@ -421,18 +419,15 @@ func (m *PostgreSQLBackend) createTables(mtable string, hatable ...string) error
 			m.logger.Warn("Skipping table creation as database is marked read-only", "err", err)
 			return nil
 		}
-		if strings.Contains(err.Error(), "SQLSTATE 23505") {
-			m.logger.Warn("Skipping table creation as other processes have already created the table", "err", err)
+		if error23505(err, "table") {
 			return nil
 		}
-
 		return fmt.Errorf("failed to execute create query: %w", err)
 	}
 
 	createIndexQuery := `CREATE INDEX IF NOT EXISTS parent_path_idx ON ` + mtable + ` (parent_path);`
 	if _, err := txn.Exec(createIndexQuery); err != nil {
-		if strings.Contains(err.Error(), "SQLSTATE 23505") {
-			m.logger.Warn("Skipping table creation as other processes have already created the index", "err", err)
+		if error23505(err, "index") {
 			return nil
 		}
 		return fmt.Errorf("failed to create index on table: %w", err)
@@ -448,8 +443,7 @@ func (m *PostgreSQLBackend) createTables(mtable string, hatable ...string) error
 			`  CONSTRAINT ha_key PRIMARY KEY (ha_key)` +
 			`);`
 		if _, err := txn.Exec(createTableQuery); err != nil {
-			if strings.Contains(err.Error(), "SQLSTATE 23505") {
-				m.logger.Warn("Skipping table creation as other processes have already created the table", "err", err)
+			if error23505(err, "ha table") {
 				return nil
 			}
 			return fmt.Errorf("failed to create ha table: %w", err)
@@ -457,8 +451,7 @@ func (m *PostgreSQLBackend) createTables(mtable string, hatable ...string) error
 	}
 
 	if err := txn.Commit(); err != nil {
-		if strings.Contains(err.Error(), "SQLSTATE 23505") {
-			m.logger.Warn("Skipping table creation as other processes have already created the table", "err", err)
+		if error23505(err, "table") {
 			return nil
 		}
 		return fmt.Errorf("failed to apply transaction: %w", err)
@@ -467,8 +460,8 @@ func (m *PostgreSQLBackend) createTables(mtable string, hatable ...string) error
 	return nil
 }
 
-// DropIfExists drop the table if it exists.
-func (m *PostgreSQLBackend) DropIfExists(ctx context.Context, _, uuid string) error {
+// DeleteMountView drop the table if it exists.
+func (m *PostgreSQLBackend) DeleteMountView(ctx context.Context, prefix, uuid string) error {
 	if !m.mEnabled {
 		return nil
 	}
@@ -483,9 +476,9 @@ func (m *PostgreSQLBackend) DropIfExists(ctx context.Context, _, uuid string) er
 	defer txn.Rollback()
 
 	tname := getTableUUID(uuid)
-	if tname == dbutil.QuoteIdentifier("openbao_kv_store") {
+	if tname == dbutil.QuoteIdentifier(openbaoKVStore) {
 		// Skip dropping the KV store table
-		m.logger.Debug("skipping drop root table for openbao_kv_store")
+		m.logger.Debug("skipping drop root table for namespace", "tname", tname)
 		return nil
 	}
 
@@ -518,25 +511,27 @@ func (m *PostgreSQLBackend) DropIfExists(ctx context.Context, _, uuid string) er
 // splitKey is a helper to split a full path key into individual
 // parts: parentPath, path, key
 func (m *PostgreSQLBackend) splitKey(fullPath string) (string, string, string) {
-	var parentPath string
-	var path string
-
-	pieces := strings.Split(fullPath, "/")
-	depth := len(pieces)
-	key := pieces[depth-1]
-
-	switch depth {
-	case 1:
-		parentPath = ""
-		path = "/"
-	case 2:
-		parentPath = "/"
-		path = "/" + pieces[0] + "/"
-	default:
-		parentPath = "/" + strings.Join(pieces[:depth-2], "/") + "/"
-		path = "/" + strings.Join(pieces[:depth-1], "/") + "/"
+	lastSlash := strings.LastIndexByte(fullPath, '/')
+	if lastSlash == -1 {
+		// No slash: depth 1
+		return "", "/", fullPath
 	}
 
+	key := fullPath[lastSlash+1:]
+
+	if lastSlash == 0 {
+		// One slash at start: depth 2
+		return "/", "/" + key + "/", key
+	}
+
+	secondLastSlash := strings.LastIndexByte(fullPath[:lastSlash], '/')
+	if secondLastSlash == -1 {
+		// No second slash: depth 2
+		return "/", fullPath[:lastSlash+1] + "/", key
+	}
+
+	parentPath := fullPath[:secondLastSlash+1]
+	path := fullPath[:lastSlash+1]
 	return parentPath, path, key
 }
 
@@ -622,6 +617,12 @@ func (m *PostgreSQLBackend) List(ctx context.Context, prefix string) ([]string, 
 
 	var keys []string
 	for rows.Next() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		var key string
 		err = rows.Scan(&key)
 		if err != nil {
@@ -629,6 +630,9 @@ func (m *PostgreSQLBackend) List(ctx context.Context, prefix string) ([]string, 
 		}
 
 		keys = append(keys, key)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error: %w", err)
 	}
 
 	return keys, nil
@@ -657,6 +661,12 @@ func (m *PostgreSQLBackend) ListPage(ctx context.Context, prefix string, after s
 
 	var keys []string
 	for rows.Next() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		var key string
 		err = rows.Scan(&key)
 		if err != nil {
@@ -664,6 +674,9 @@ func (m *PostgreSQLBackend) ListPage(ctx context.Context, prefix string, after s
 		}
 
 		keys = append(keys, key)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error: %w", err)
 	}
 
 	return keys, nil
