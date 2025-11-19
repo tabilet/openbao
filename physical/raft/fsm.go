@@ -36,8 +36,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/armon/go-metrics"
 	log "github.com/hashicorp/go-hclog"
+	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-raftchunking"
 	"github.com/hashicorp/go-secure-stdlib/strutil"
@@ -164,6 +164,7 @@ type FSM struct {
 	fastTxnTracker *fsmTxnCommitIndexTracker
 
 	mEnabled bool
+	invalidateHook physical.InvalidateFunc
 }
 
 // NewFSM constructs a FSM using the given directory
@@ -233,6 +234,13 @@ func (f *FSM) withDBView(ctx context.Context, fn func(*bolt.DB) error) error {
 	defer f.l.RUnlock()
 
 	return fn(db)
+}
+
+func (f *FSM) hookInvalidate(hook physical.InvalidateFunc) {
+	f.l.Lock()
+	defer f.l.Unlock()
+
+	f.invalidateHook = hook
 }
 
 // withDBUpdate executes a read-write function against the database for the given context.
@@ -1561,6 +1569,23 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 
 	if lowestActiveIndex != nil {
 		f.fastTxnTracker.clearOldEntries(*lowestActiveIndex)
+	}
+
+	if f.invalidateHook != nil {
+		var keys []string
+		for _, commandRaw := range commands {
+			switch command := commandRaw.(type) {
+			case *LogData:
+				for _, op := range command.Operations {
+					switch op.OpType {
+					case putOp, deleteOp:
+						keys = append(keys, op.Key)
+					}
+				}
+			}
+		}
+
+		go f.invalidateHook(keys...)
 	}
 
 	// If we advanced the latest value, update the in-memory representation too.
