@@ -67,11 +67,11 @@ var getMmapFlags = func(string) int { return 0 }
 
 // Verify RaftBackend satisfies the correct interfaces
 var (
-	_ physical.Backend       = (*RaftBackend)(nil)
-	_ physical.Transactional = (*RaftBackend)(nil)
-	_ physical.HABackend     = (*RaftBackend)(nil)
-	_ physical.Lock          = (*RaftLock)(nil)
-	_ physical.Mountable     = (*RaftBackend)(nil)
+	_ physical.Backend                  = (*RaftBackend)(nil)
+	_ physical.Transactional            = (*RaftBackend)(nil)
+	_ physical.HABackend                = (*RaftBackend)(nil)
+	_ physical.Lock                     = (*RaftLock)(nil)
+	_ physical.Mountable                = (*RaftBackend)(nil)
 	_ physical.CacheInvalidationBackend = (*RaftBackend)(nil)
 )
 

@@ -163,7 +163,7 @@ type FSM struct {
 	// tracker for fast application of transactions
 	fastTxnTracker *fsmTxnCommitIndexTracker
 
-	mEnabled bool
+	mEnabled       bool
 	invalidateHook physical.InvalidateFunc
 }
 
@@ -844,7 +844,9 @@ func (f *FSM) logUnknownOpType(opType uint32) {
 }
 
 // applyBatchNonTxOps applies non-transactional operations within ApplyBatch.
-func (f *FSM) applyBatchNonTxOps(b *bolt.Bucket, txnState *fsmTxnCommitIndexApplicationState, command *LogData) error {
+// Returns a slice of keys that were successfully written for cache invalidation.
+func (f *FSM) applyBatchNonTxOps(b *bolt.Bucket, txnState *fsmTxnCommitIndexApplicationState, command *LogData) ([]string, error) {
+	var writtenKeys []string
 	for _, op := range command.Operations {
 		var err error
 		switch op.OpType {
@@ -854,12 +856,14 @@ func (f *FSM) applyBatchNonTxOps(b *bolt.Bucket, txnState *fsmTxnCommitIndexAppl
 				// This log occurs directly to the state tracker, so we
 				// want to ensure we only track it when the write succeeded.
 				txnState.logWrite(op.Key)
+				writtenKeys = append(writtenKeys, op.Key)
 			}
 		case deleteOp:
 			err = b.Delete([]byte(op.Key))
 			if err == nil {
 				// See note above.
 				txnState.logWrite(op.Key)
+				writtenKeys = append(writtenKeys, op.Key)
 			}
 		case restoreCallbackOp:
 			if f.restoreCb != nil {
@@ -871,16 +875,17 @@ func (f *FSM) applyBatchNonTxOps(b *bolt.Bucket, txnState *fsmTxnCommitIndexAppl
 		}
 
 		if err != nil {
-			return err
+			return writtenKeys, err
 		}
 	}
 
-	return nil
+	return writtenKeys, nil
 }
 
 // applyBatchTxOps applies a transaction within the broader context of the batch's transaction.
 // It first verifies all operations can apply correctly before performing any writes.
-func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommitIndexApplicationState, command *LogData) error {
+// Returns a slice of keys that were successfully written for cache invalidation.
+func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommitIndexApplicationState, command *LogData) ([]string, error) {
 	txnState.setInTx()
 
 	// First we verify the transaction can apply correctly before doing any
@@ -896,13 +901,13 @@ func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommi
 		case beginTxOp, commitTxOp:
 			// Ensure a well-formed transaction.
 			if command.Operations[0].OpType != beginTxOp || command.Operations[len(command.Operations)-1].OpType != commitTxOp || (index != 0 && index != len(command.Operations)-1) {
-				return fmt.Errorf("unsupported transaction: saw beginTxOp/commitTxOp mixed inside other operations: %w", physical.ErrTransactionCommitFailure)
+				return nil, fmt.Errorf("unsupported transaction: saw beginTxOp/commitTxOp mixed inside other operations: %w", physical.ErrTransactionCommitFailure)
 			}
 
 			if op.OpType == beginTxOp {
 				s, err := parseBeginTxOpValue(op.Value)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				txnState.setStartIndex(s.Index)
 			}
@@ -919,11 +924,12 @@ func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommi
 		}
 
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	// Now we apply the write operations since the verification succeeded.
+	var writtenKeys []string
 	for _, op := range command.Operations {
 		switch op.OpType {
 		case beginTxOp, commitTxOp:
@@ -931,9 +937,11 @@ func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommi
 		case putOp:
 			err = b.Put([]byte(op.Key), op.Value)
 			txnState.logWrite(op.Key)
+			writtenKeys = append(writtenKeys, op.Key)
 		case deleteOp:
 			err = b.Delete([]byte(op.Key))
 			txnState.logWrite(op.Key)
+			writtenKeys = append(writtenKeys, op.Key)
 		case verifyReadOp:
 			// ignore
 		case verifyListOp:
@@ -943,7 +951,7 @@ func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommi
 		}
 
 		if err != nil {
-			return err
+			return writtenKeys, err
 		}
 	}
 
@@ -951,7 +959,7 @@ func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommi
 	// the central fast application tracking.
 	txnState.finishTxn()
 
-	return nil
+	return writtenKeys, nil
 }
 
 // ApplyBatch will apply a set of logs to the FSM. This is called from the raft
@@ -1051,9 +1059,9 @@ func (f *FSM) ApplyBatchOld(logs []*raft.Log) []interface{} {
 				txnState := f.fastTxnTracker.applyState(latestIndex, commandIndex, logs[commandIndex].Index)
 				b := tx.Bucket(dataBucketName)
 				if len(command.Operations) == 0 || command.Operations[0].OpType != beginTxOp {
-					err = f.applyBatchNonTxOps(b, txnState, command)
+					_, err = f.applyBatchNonTxOps(b, txnState, command)
 				} else {
-					err = f.applyBatchTxOps(tx, b, txnState, command)
+					_, err = f.applyBatchTxOps(tx, b, txnState, command)
 				}
 
 				if command.LowestActiveIndex != nil {
@@ -1245,9 +1253,9 @@ func (f *FSM) ApplyBatchTry(logs []*raft.Log) []interface{} {
 				b := tx.Bucket(dataBucketName)
 				txnState := f.fastTxnTracker.applyState(latestIndexAtomic, commandIndex, logs[commandIndex].Index)
 				if len(command.Operations) == 0 || command.Operations[0].OpType != beginTxOp {
-					err = f.applyBatchNonTxOps(b, txnState, command)
+					_, err = f.applyBatchNonTxOps(b, txnState, command)
 				} else {
-					err = f.applyBatchTxOps(tx, b, txnState, command)
+					_, err = f.applyBatchTxOps(tx, b, txnState, command)
 				}
 
 				if command.LowestActiveIndex != nil {
@@ -1437,6 +1445,9 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		f.applyCallback()
 	}
 
+	// Track keys that were successfully written for cache invalidation
+	var writtenKeys []string
+
 	// Group commands by database for efficient batch processing.
 	// Use a single transaction per unique database (like ApplyBatchOld),
 	// but support multiple databases (like ApplyBatch).
@@ -1491,10 +1502,16 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 				switch command := cmdInfo.commandRaw.(type) {
 				case *LogData:
 					txnState := f.fastTxnTracker.applyState(latestIndexAtomic, cmdInfo.index, cmdInfo.log.Index)
+					var opWrittenKeys []string
 					if len(command.Operations) == 0 || command.Operations[0].OpType != beginTxOp {
-						err = f.applyBatchNonTxOps(b, txnState, command)
+						opWrittenKeys, err = f.applyBatchNonTxOps(b, txnState, command)
 					} else {
-						err = f.applyBatchTxOps(tx, b, txnState, command)
+						opWrittenKeys, err = f.applyBatchTxOps(tx, b, txnState, command)
+					}
+
+					// Only add to writtenKeys if the operation succeeded
+					if err == nil {
+						writtenKeys = append(writtenKeys, opWrittenKeys...)
 					}
 
 					if command.LowestActiveIndex != nil {
@@ -1571,21 +1588,11 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		f.fastTxnTracker.clearOldEntries(*lowestActiveIndex)
 	}
 
-	if f.invalidateHook != nil {
-		var keys []string
-		for _, commandRaw := range commands {
-			switch command := commandRaw.(type) {
-			case *LogData:
-				for _, op := range command.Operations {
-					switch op.OpType {
-					case putOp, deleteOp:
-						keys = append(keys, op.Key)
-					}
-				}
-			}
-		}
-
-		go f.invalidateHook(keys...)
+	// Capture hook locally to avoid race with concurrent hookInvalidate() calls.
+	// Only invalidate keys that were actually written successfully.
+	hook := f.invalidateHook
+	if hook != nil && len(writtenKeys) > 0 {
+		go hook(writtenKeys...)
 	}
 
 	// If we advanced the latest value, update the in-memory representation too.
