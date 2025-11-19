@@ -47,8 +47,8 @@ import (
 	"github.com/openbao/openbao/sdk/v2/plugin/pb"
 	"github.com/rboyer/safeio"
 	bolt "go.etcd.io/bbolt"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/proto"
-	"zgo.at/zcache/v2"
 )
 
 const (
@@ -126,6 +126,13 @@ type FSMApplyResponse struct {
 	EntrySlice []*FSMEntry
 }
 
+// dbCacheEntry wraps a database handle with expiration information
+type dbCacheEntry struct {
+	db        *bolt.DB
+	expiresAt time.Time
+	noExpire  bool // true for default database
+}
+
 // FSM is Vault's primary state storage. It writes updates to a bolt db file
 // that lives on local disk. FSM implements raft.FSM and physical.Backend
 // interfaces.
@@ -148,8 +155,16 @@ type FSM struct {
 	// applyCallback is used to control the pace of applies in tests
 	applyCallback func()
 
-	dbCache *zcache.Cache[string, *bolt.DB]
-	// db *bolt.DB
+	// Database cache using sync.Map for lock-free reads
+	dbCache sync.Map // map[string]*dbCacheEntry
+
+	// singleflight group prevents duplicate database opens
+	dbOpenGroup singleflight.Group
+
+	// Expiration configuration
+	namespaceDBExpiration time.Duration
+	expirationCheckPeriod time.Duration
+	stopExpiration        chan struct{}
 
 	// retoreCb is called after we've restored a snapshot
 	restoreCb restoreCallback
@@ -199,10 +214,21 @@ func NewFSM(path string, localID string, mEnabled bool, expire, cleanup time.Dur
 		ctx: context.Background(),
 	})
 
-	f.dbCache = zcache.New[string, *bolt.DB](expire, cleanup)
-	_, err := f.getDB(databaseFilename())
+	// Initialize expiration configuration
+	f.namespaceDBExpiration = expire
+	f.expirationCheckPeriod = cleanup
+	f.stopExpiration = make(chan struct{})
 
-	return f, err
+	// Open the default database
+	_, err := f.getDB(databaseFilename())
+	if err != nil {
+		return nil, err
+	}
+
+	// Start background expiration goroutine
+	go f.runExpirationCleanup()
+
+	return f, nil
 }
 
 func (f *FSM) getDatabaseName(ctx context.Context) (string, error) {
@@ -223,16 +249,14 @@ func (f *FSM) getDatabaseForContext(ctx context.Context) (*bolt.DB, error) {
 }
 
 // withDBView executes a read-only function against the database for the given context.
-// It handles database retrieval and locking automatically.
+// It handles database retrieval automatically. No FSM locks needed - sync.Map is lock-free!
 func (f *FSM) withDBView(ctx context.Context, fn func(*bolt.DB) error) error {
 	db, err := f.getDatabaseForContext(ctx)
 	if err != nil {
 		return err
 	}
 
-	f.l.RLock()
-	defer f.l.RUnlock()
-
+	// No FSM lock needed! sync.Map handles concurrency
 	return fn(db)
 }
 
@@ -244,46 +268,82 @@ func (f *FSM) hookInvalidate(hook physical.InvalidateFunc) {
 }
 
 // withDBUpdate executes a read-write function against the database for the given context.
-// It handles database retrieval and locking automatically.
+// It handles database retrieval automatically. No FSM locks needed - sync.Map is lock-free!
 func (f *FSM) withDBUpdate(ctx context.Context, fn func(*bolt.DB) error) error {
 	db, err := f.getDatabaseForContext(ctx)
 	if err != nil {
 		return err
 	}
 
-	f.l.RLock()
-	defer f.l.RUnlock()
-
+	// No FSM lock needed! sync.Map handles concurrency
+	// BoltDB's Update() provides write serialization per database
 	return fn(db)
 }
 
+// getDB retrieves or opens a database - NO EXCLUSIVE LOCKS!
 func (f *FSM) getDB(filename string) (*bolt.DB, error) {
-	f.l.RLock()
+	// Fast path - lock-free cache lookup
+	if entry, ok := f.dbCache.Load(filename); ok {
+		cacheEntry := entry.(*dbCacheEntry)
 
-	db, ok := f.dbCache.Get(filename)
-	f.l.RUnlock() // Release immediately after read
-	if ok {
-		return db, nil
-	}
-
-	f.l.Lock()
-	defer f.l.Unlock()
-
-	// Double-check after acquiring write lock (race protection)
-	db, ok = f.dbCache.Get(filename)
-	if ok {
-		return db, nil
-	}
-
-	db, err := f.openDBFile(filename)
-	if err == nil {
-		if filename == databaseFilename() {
-			f.dbCache.SetWithExpire(filename, db, zcache.NoExpiration)
+		// Check if expired (only for namespace databases)
+		if !cacheEntry.noExpire && time.Now().After(cacheEntry.expiresAt) {
+			// Mark as expired, will be reopened
+			f.dbCache.Delete(filename)
+			// Fall through to slow path
 		} else {
-			f.dbCache.Set(filename, db)
+			return cacheEntry.db, nil
 		}
 	}
-	return db, err
+
+	// Slow path - use singleflight to ensure only one goroutine opens the database
+	// Key insight: singleflight handles all the coordination WITHOUT exclusive locks!
+	result, err, shared := f.dbOpenGroup.Do(filename, func() (interface{}, error) {
+		// Double-check cache inside singleflight (another goroutine may have opened it)
+		if entry, ok := f.dbCache.Load(filename); ok {
+			cacheEntry := entry.(*dbCacheEntry)
+			if cacheEntry.noExpire || time.Now().Before(cacheEntry.expiresAt) {
+				return cacheEntry.db, nil
+			}
+			// Expired, need to close and reopen
+			if err := cacheEntry.db.Close(); err != nil {
+				f.logger.Warn("failed to close expired database", "database", filename, "error", err)
+			}
+			f.dbCache.Delete(filename)
+		}
+
+		// Actually open the database file
+		db, err := f.openDBFile(filename)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open database %s: %w", filename, err)
+		}
+
+		// Create cache entry with expiration
+		entry := &dbCacheEntry{
+			db:       db,
+			noExpire: filename == databaseFilename(), // Default DB never expires
+		}
+
+		if !entry.noExpire {
+			entry.expiresAt = time.Now().Add(f.namespaceDBExpiration)
+		}
+
+		// Store in cache (lock-free operation!)
+		f.dbCache.Store(filename, entry)
+
+		f.logger.Debug("opened database",
+			"filename", filename,
+			"shared", shared,
+			"expires", entry.expiresAt)
+
+		return db, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return result.(*bolt.DB), nil
 }
 
 // getAllDatabases returns a list of all database filenames in the FSM directory.
@@ -337,6 +397,58 @@ func (f *FSM) findDatabasesInDir(dir string) ([]string, error) {
 	}
 
 	return databases, nil
+}
+
+// runExpirationCleanup runs in background to expire old namespace databases
+func (f *FSM) runExpirationCleanup() {
+	ticker := time.NewTicker(f.expirationCheckPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			f.expireOldDatabases()
+		case <-f.stopExpiration:
+			return
+		}
+	}
+}
+
+// expireOldDatabases closes and removes expired namespace databases from cache
+func (f *FSM) expireOldDatabases() {
+	now := time.Now()
+	var toExpire []string
+
+	// Collect expired entries
+	f.dbCache.Range(func(key, value interface{}) bool {
+		filename := key.(string)
+		entry := value.(*dbCacheEntry)
+
+		// Skip default database and non-expired entries
+		if entry.noExpire || now.Before(entry.expiresAt) {
+			return true // continue
+		}
+
+		toExpire = append(toExpire, filename)
+		return true
+	})
+
+	// Close and remove expired databases
+	for _, filename := range toExpire {
+		if entry, ok := f.dbCache.LoadAndDelete(filename); ok {
+			cacheEntry := entry.(*dbCacheEntry)
+			if err := cacheEntry.db.Close(); err != nil {
+				f.logger.Warn("failed to close expired database",
+					"database", filename, "error", err)
+			} else {
+				f.logger.Debug("expired and closed database", "database", filename)
+			}
+		}
+	}
+
+	if len(toExpire) > 0 {
+		f.logger.Info("expired namespace databases", "count", len(toExpire))
+	}
 }
 
 // SetFSMDelay adds a delay to the FSM apply. This is used in tests to simulate
@@ -423,15 +535,19 @@ func (f *FSM) openDBFile(filename string) (*bolt.DB, error) {
 
 func (f *FSM) closeDBFile(filename string) error {
 	if len(filename) == 0 {
-		return errors.New("can not open empty filename")
+		return errors.New("cannot close empty filename")
 	}
+
+	// Remove from cache and close database
+	if entry, ok := f.dbCache.LoadAndDelete(filename); ok {
+		cacheEntry := entry.(*dbCacheEntry)
+		if err := cacheEntry.db.Close(); err != nil {
+			return err
+		}
+	}
+
+	// Remove database file from disk
 	dbPath := filepath.Join(f.path, filename)
-
-	f.l.RLock()
-	defer f.l.RUnlock()
-
-	f.dbCache.Delete(filename)
-
 	return os.Remove(dbPath)
 }
 
@@ -439,12 +555,14 @@ func (f *FSM) closeDBFile(filename string) error {
 // database files. This includes metrics for free pages, transactions, and
 // storage utilization.
 func (f *FSM) Stats() bolt.Stats {
-	f.l.RLock()
-	defer f.l.RUnlock()
-
 	var stats bolt.Stats
-	for _, db := range f.dbCache.Items() {
-		s := db.Object.Stats()
+
+	// Iterate over all cached databases using sync.Map
+	f.dbCache.Range(func(key, value interface{}) bool {
+		entry := value.(*dbCacheEntry)
+		s := entry.db.Stats()
+
+		// Aggregate all stats
 		stats.FreePageN += s.FreePageN
 		stats.PendingPageN += s.PendingPageN
 		stats.FreeAlloc += s.FreeAlloc
@@ -463,22 +581,40 @@ func (f *FSM) Stats() bolt.Stats {
 		stats.TxStats.SpillTime += s.TxStats.SpillTime
 		stats.TxStats.Write += s.TxStats.Write
 		stats.TxStats.WriteTime += s.TxStats.WriteTime
-	}
+
+		return true // continue iteration
+	})
+
 	return stats
 }
 
 func (f *FSM) Close() error {
-	f.l.RLock()
-	defer f.l.RUnlock()
+	// Stop expiration goroutine
+	close(f.stopExpiration)
 
-	for _, db := range f.dbCache.Items() {
-		if err := db.Object.Close(); err != nil {
-			return err
+	// Close all databases
+	var firstErr error
+	f.dbCache.Range(func(key, value interface{}) bool {
+		filename := key.(string)
+		entry := value.(*dbCacheEntry)
+
+		if err := entry.db.Close(); err != nil {
+			f.logger.Error("failed to close database", "database", filename, "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
-	}
 
-	f.dbCache.DeleteAll()
-	return nil
+		return true // continue iteration
+	})
+
+	// Clear the cache
+	f.dbCache.Range(func(key, value interface{}) bool {
+		f.dbCache.Delete(key)
+		return true
+	})
+
+	return firstErr
 }
 
 func writeSnapshotMetaToDB(metadata *raft.SnapshotMeta, db *bolt.DB) error {
@@ -962,7 +1098,8 @@ func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommi
 	return writtenKeys, nil
 }
 
-// ApplyBatch will apply a set of logs to the FSM. This is called from the raft
+/*
+// ApplyBatchOld will apply a set of logs to the FSM. This is called from the raft
 // library.
 func (f *FSM) ApplyBatchOld(logs []*raft.Log) []interface{} {
 	numLogs := len(logs)
@@ -1361,6 +1498,7 @@ func (f *FSM) ApplyBatchTry(logs []*raft.Log) []interface{} {
 
 	return resp
 }
+*/
 
 // ApplyBatch combines multi-database support from ApplyBatchTry with the single
 // transaction pattern from ApplyBatchOld. It groups commands by database and
