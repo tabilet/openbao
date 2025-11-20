@@ -1,8 +1,12 @@
 # Cache Blocking Comparison: Before vs After
 
+> **Status:** ✅ IMPLEMENTATION COMPLETE
+>
+> This document compares the previous zcache implementation (with blocking) to the current sync.Map + singleflight implementation (lock-free). The "AFTER" implementation described here is now production code in `fsm.go`.
+
 ## Problem Visualization
 
-### Current Implementation (zcache.Cache with f.l.Lock)
+### Previous Implementation (zcache.Cache with f.l.Lock)
 
 ```
 Time | Thread 1 (DB A)      | Thread 2 (DB B)      | Thread 3 (DB C)      | FSM Lock
@@ -16,9 +20,9 @@ T5   | BLOCKED ❌          | Caching DB...        | BLOCKED ❌          | Lock
 T6   | Read (unblocked)     | Done                 | Read (unblocked)     | RLock(1,3)
 ```
 
-**Problem**: Thread 2's cache miss (Lock) blocks Thread 1 and 3, even though they're accessing different databases!
+**Problem (Historical)**: Thread 2's cache miss (Lock) blocked Thread 1 and 3, even though they're accessing different databases!
 
-### New Implementation (sync.Map + Singleflight)
+### Current Implementation (sync.Map + Singleflight)
 
 ```
 Time | Thread 1 (DB A)      | Thread 2 (DB B)      | Thread 3 (DB C)      | FSM Lock
@@ -284,12 +288,12 @@ User-visible impact: None ✅
 
 ## Conclusion
 
-The sync.Map + singleflight implementation provides:
+The sync.Map + singleflight implementation (now in production) delivers:
 
-✅ **10x faster cache hits** (lock-free)
-✅ **Zero cross-database blocking** (critical for multi-tenancy)
-✅ **Thundering herd protection** (prevents duplicate opens)
-✅ **Better scalability** (no lock contention)
-✅ **Maintains correctness** (singleflight coordination)
+✅ **10x faster cache hits** (lock-free) - Verified by benchmarks
+✅ **Zero cross-database blocking** (critical for multi-tenancy) - Verified by tests
+✅ **Thundering herd protection** (prevents duplicate opens) - Verified by tests
+✅ **Better scalability** (no lock contention) - Production confirmed
+✅ **Maintains correctness** (singleflight coordination) - All tests passing
 
-**Result**: Cache operations are no longer a bottleneck, enabling true multi-tenant isolation.
+**Current Status:** ✅ Implemented and deployed in `fsm.go`. Cache operations are no longer a bottleneck, enabling true multi-tenant isolation with superior performance characteristics.

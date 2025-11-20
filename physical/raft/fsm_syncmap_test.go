@@ -4,9 +4,7 @@
 package raft
 
 import (
-	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -17,25 +15,91 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// TestCacheOperationNoBlocking verifies that cache misses don't block other operations
-func TestCacheOperationNoBlocking(t *testing.T) {
-	// Create temporary directory
-	tmpDir := t.TempDir()
+// testFSMOption is a functional option for configuring test FSM instances
+type testFSMOption func(*FSM)
 
-	// Create FSM with sync.Map
-	f := &FSMWithSyncMap{
+// withLogger sets a custom logger for the test FSM
+func withLogger(logger log.Logger) testFSMOption {
+	return func(f *FSM) {
+		f.logger = logger
+	}
+}
+
+// withExpiration sets custom expiration times for the test FSM
+func withExpiration(expiration, checkPeriod time.Duration) testFSMOption {
+	return func(f *FSM) {
+		f.namespaceDBExpiration = expiration
+		f.expirationCheckPeriod = checkPeriod
+	}
+}
+
+// withMEnabled sets the multi-database enabled flag
+func withMEnabled(enabled bool) testFSMOption {
+	return func(f *FSM) {
+		f.mEnabled = enabled
+	}
+}
+
+// withOpenDBHook sets a custom database open hook for testing
+func withOpenDBHook(hook func(filename string, openFn func(string) (*bolt.DB, error)) (*bolt.DB, error)) testFSMOption {
+	return func(f *FSM) {
+		f.openDBFileHook = hook
+	}
+}
+
+// testingTB is an interface that both *testing.T and *testing.B satisfy
+type testingTB interface {
+	Helper()
+	TempDir() string
+}
+
+// newTestFSM creates a new FSM instance for testing with sensible defaults.
+// Use functional options to customize specific fields as needed.
+func newTestFSM(tb testingTB, opts ...testFSMOption) *FSM {
+	tb.Helper()
+
+	tmpDir := tb.TempDir()
+
+	// Initialize atomic fields
+	latestTerm := new(uint64)
+	latestIndex := new(uint64)
+	latestConfig := atomic.Value{}
+	atomic.StoreUint64(latestTerm, 0)
+	atomic.StoreUint64(latestIndex, 0)
+	latestConfig.Store((*ConfigurationValue)(nil))
+
+	// Create FSM with default test configuration
+	f := &FSM{
 		path:                  tmpDir,
 		logger:                log.NewNullLogger(),
 		mEnabled:              true,
 		namespaceDBExpiration: 1 * time.Hour,
 		expirationCheckPeriod: 5 * time.Minute,
 		stopExpiration:        make(chan struct{}),
+		latestTerm:            latestTerm,
+		latestIndex:           latestIndex,
+		latestConfig:          latestConfig,
+		desiredSuffrage:       "voter",
+		fastTxnTracker:        FsmTxnCommitIndexTracker(),
 	}
+
+	// Apply any custom options
+	for _, opt := range opts {
+		opt(f)
+	}
+
+	return f
+}
+
+// TestCacheOperationNoBlocking verifies that cache misses don't block other operations
+func TestCacheOperationNoBlocking(t *testing.T) {
+	f := newTestFSM(t)
+	tmpDir := f.path
 
 	// Create multiple database files
 	for i := 0; i < 5; i++ {
 		dbPath := filepath.Join(tmpDir, fmt.Sprintf("db%d.db", i))
-		db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
+		db, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 		if err != nil {
 			t.Fatalf("failed to create test database: %v", err)
 		}
@@ -93,34 +157,25 @@ func TestCacheOperationNoBlocking(t *testing.T) {
 
 // TestSingleflightPreventsDuplicateOpens verifies singleflight prevents duplicate opens
 func TestSingleflightPreventsDuplicateOpens(t *testing.T) {
-	tmpDir := t.TempDir()
+	// Track how many times openDBFile is called
+	var openCount atomic.Int32
 
-	f := &FSMWithSyncMap{
-		path:                  tmpDir,
-		logger:                log.NewNullLogger(),
-		mEnabled:              true,
-		namespaceDBExpiration: 1 * time.Hour,
-		expirationCheckPeriod: 5 * time.Minute,
-		stopExpiration:        make(chan struct{}),
-	}
+	f := newTestFSM(t, withOpenDBHook(func(filename string, openFn func(string) (*bolt.DB, error)) (*bolt.DB, error) {
+		openCount.Add(1)
+		time.Sleep(50 * time.Millisecond) // Simulate slow open
+		return openFn(filename)
+	}))
+
+	tmpDir := f.path
 
 	// Create test database
 	dbName := "test.db"
 	dbPath := filepath.Join(tmpDir, dbName)
-	db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	db, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		t.Fatalf("failed to create test database: %v", err)
 	}
 	db.Close()
-
-	// Track how many times openDBFile is called
-	var openCount atomic.Int32
-	originalOpen := f.openDBFile
-	f.openDBFile = func(filename string) (*bolt.DB, error) {
-		openCount.Add(1)
-		time.Sleep(50 * time.Millisecond) // Simulate slow open
-		return originalOpen(filename)
-	}
 
 	// Launch 10 goroutines trying to open the same database simultaneously
 	var wg sync.WaitGroup
@@ -146,21 +201,16 @@ func TestSingleflightPreventsDuplicateOpens(t *testing.T) {
 
 // TestCacheExpiration verifies namespace databases expire correctly
 func TestCacheExpiration(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	f := &FSMWithSyncMap{
-		path:                  tmpDir,
-		logger:                log.New(&log.LoggerOptions{Level: log.Debug}),
-		mEnabled:              true,
-		namespaceDBExpiration: 100 * time.Millisecond, // Short expiration for testing
-		expirationCheckPeriod: 50 * time.Millisecond,  // Check frequently
-		stopExpiration:        make(chan struct{}),
-	}
+	f := newTestFSM(t,
+		withLogger(log.New(&log.LoggerOptions{Level: log.Debug})),
+		withExpiration(100*time.Millisecond, 50*time.Millisecond),
+	)
+	tmpDir := f.path
 
 	// Create namespace database
 	nsDBName := "namespace.db"
 	nsDBPath := filepath.Join(tmpDir, nsDBName)
-	db, err := bolt.Open(nsDBPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	db, err := bolt.Open(nsDBPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		t.Fatalf("failed to create namespace database: %v", err)
 	}
@@ -193,21 +243,13 @@ func TestCacheExpiration(t *testing.T) {
 
 // TestDefaultDatabaseNeverExpires verifies default database doesn't expire
 func TestDefaultDatabaseNeverExpires(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	f := &FSMWithSyncMap{
-		path:                  tmpDir,
-		logger:                log.NewNullLogger(),
-		mEnabled:              true,
-		namespaceDBExpiration: 100 * time.Millisecond,
-		expirationCheckPeriod: 50 * time.Millisecond,
-		stopExpiration:        make(chan struct{}),
-	}
+	f := newTestFSM(t, withExpiration(100*time.Millisecond, 50*time.Millisecond))
+	tmpDir := f.path
 
 	// Create default database
 	defaultDB := databaseFilename()
 	defaultPath := filepath.Join(tmpDir, defaultDB)
-	db, err := bolt.Open(defaultPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	db, err := bolt.Open(defaultPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		t.Fatalf("failed to create default database: %v", err)
 	}
@@ -235,16 +277,8 @@ func TestDefaultDatabaseNeverExpires(t *testing.T) {
 
 // TestConcurrentReadsDifferentDatabases verifies reads don't block each other
 func TestConcurrentReadsDifferentDatabases(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	f := &FSMWithSyncMap{
-		path:                  tmpDir,
-		logger:                log.NewNullLogger(),
-		mEnabled:              true,
-		namespaceDBExpiration: 1 * time.Hour,
-		expirationCheckPeriod: 5 * time.Minute,
-		stopExpiration:        make(chan struct{}),
-	}
+	f := newTestFSM(t)
+	tmpDir := f.path
 
 	// Create multiple databases with test data
 	numDBs := 5
@@ -252,7 +286,7 @@ func TestConcurrentReadsDifferentDatabases(t *testing.T) {
 		dbName := fmt.Sprintf("db%d.db", i)
 		dbPath := filepath.Join(tmpDir, dbName)
 
-		db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
+		db, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 		if err != nil {
 			t.Fatalf("failed to create database %s: %v", dbName, err)
 		}
@@ -298,7 +332,6 @@ func TestConcurrentReadsDifferentDatabases(t *testing.T) {
 				}
 				return nil
 			})
-
 			if err != nil {
 				t.Errorf("read failed: %v", err)
 				return
@@ -328,20 +361,12 @@ func TestConcurrentReadsDifferentDatabases(t *testing.T) {
 
 // BenchmarkGetDBCacheHit benchmarks cache hit performance
 func BenchmarkGetDBCacheHit(b *testing.B) {
-	tmpDir := b.TempDir()
-
-	f := &FSMWithSyncMap{
-		path:                  tmpDir,
-		logger:                log.NewNullLogger(),
-		mEnabled:              true,
-		namespaceDBExpiration: 1 * time.Hour,
-		expirationCheckPeriod: 5 * time.Minute,
-		stopExpiration:        make(chan struct{}),
-	}
+	f := newTestFSM(b)
+	tmpDir := f.path
 
 	// Create and cache database
 	dbPath := filepath.Join(tmpDir, "test.db")
-	db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	db, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		b.Fatalf("failed to create database: %v", err)
 	}
@@ -367,21 +392,13 @@ func BenchmarkGetDBCacheHit(b *testing.B) {
 
 // BenchmarkGetDBCacheMiss benchmarks cache miss performance
 func BenchmarkGetDBCacheMiss(b *testing.B) {
-	tmpDir := b.TempDir()
-
-	f := &FSMWithSyncMap{
-		path:                  tmpDir,
-		logger:                log.NewNullLogger(),
-		mEnabled:              true,
-		namespaceDBExpiration: 1 * time.Hour,
-		expirationCheckPeriod: 5 * time.Minute,
-		stopExpiration:        make(chan struct{}),
-	}
+	f := newTestFSM(b)
+	tmpDir := f.path
 
 	// Create database files but don't cache them
 	for i := 0; i < b.N; i++ {
 		dbPath := filepath.Join(tmpDir, fmt.Sprintf("db%d.db", i))
-		db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
+		db, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 		if err != nil {
 			b.Fatalf("failed to create database: %v", err)
 		}

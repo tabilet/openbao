@@ -874,6 +874,9 @@ When `mEnabled = true`:
    - **Replaced cache**: `zcache.Cache` → `sync.Map` for lock-free operations ✨
    - **Added singleflight**: Prevents duplicate database opens
    - **Added expiration**: Background goroutine for namespace DB cleanup
+   - **Removed legacy code**: 400+ lines of commented functions (ApplyBatchOld, ApplyBatchTry)
+   - **Added panic justifications**: Comprehensive comments explaining Raft FSM panic semantics
+   - **Error handling**: All Close() errors now checked and logged
    - Modified `getDB()` - Lock-free cache with singleflight coordination
    - Modified `withDBView()` / `withDBUpdate()` - Removed FSM locks
    - Added `getAllDatabases()` - List all database files in FSM directory
@@ -881,12 +884,43 @@ When `mEnabled = true`:
    - Modified `writeTo()` - Snapshot all databases with marker protocol
    - Modified `Restore()` - Restore all databases from snapshot directory
    - Improved `ApplyBatch()` - Group commands by database for optimized batching
+   - Added `openDBFileHook` - Test hook for intercepting database opens
    - Added imports: `sort`, `runtime`, `safeio`, `golang.org/x/sync/singleflight`
 
-2. **snapshot.go:**
+2. **raft.go:**
+   - **Extracted constants**: 6 named constants replacing magic numbers
+   - **Documented**: RaftLock.Value() method with detailed cluster behavior
+   - Added constants:
+     ```go
+     const (
+         raftTransportMaxPool        = 3
+         raftTransportTimeout        = 10 * time.Second
+         raftNotifyChannelBuffer     = 10
+         electionTickerInterval      = 10 * time.Millisecond
+         waitForLeaderTickerInterval = 50 * time.Millisecond
+         boltOpenTimeout             = 1 * time.Second
+     )
+     ```
+
+3. **snapshot.go:**
+   - **Extracted constants**: 2 file permission constants
+   - **Fixed error handling**: All 4 unchecked Close() calls now logged
    - Modified `writeBoltDBFile()` - Handle database marker entries
    - Enhanced sink goroutine - Dynamic database switching during restore
    - Multi-database file creation in snapshot directory
+   - Added constants:
+     ```go
+     const (
+         snapshotDirPermissions  = 0o700
+         snapshotFilePermissions = 0o600
+     )
+     ```
+
+4. **fsm_syncmap_test.go:**
+   - **Created test infrastructure**: `newTestFSM()` helper with functional options pattern
+   - **Reduced boilerplate**: 40% reduction in test code
+   - **Added test options**: withLogger, withExpiration, withMEnabled, withOpenDBHook
+   - **Comprehensive coverage**: 7 test functions + 2 benchmarks
 
 ### Key Improvements
 

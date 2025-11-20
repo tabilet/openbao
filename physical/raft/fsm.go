@@ -155,6 +155,9 @@ type FSM struct {
 	// applyCallback is used to control the pace of applies in tests
 	applyCallback func()
 
+	// openDBFileHook is used to wrap openDBFile calls in tests (for counting, delaying, etc.)
+	openDBFileHook func(filename string, openFn func(string) (*bolt.DB, error)) (*bolt.DB, error)
+
 	// Database cache using sync.Map for lock-free reads
 	dbCache sync.Map // map[string]*dbCacheEntry
 
@@ -331,11 +334,6 @@ func (f *FSM) getDB(filename string) (*bolt.DB, error) {
 		// Store in cache (lock-free operation!)
 		f.dbCache.Store(filename, entry)
 
-		f.logger.Debug("opened database",
-			"filename", filename,
-			"shared", shared,
-			"expires", entry.expiresAt)
-
 		return db, nil
 	})
 
@@ -343,7 +341,19 @@ func (f *FSM) getDB(filename string) (*bolt.DB, error) {
 		return nil, err
 	}
 
-	return result.(*bolt.DB), nil
+	db := result.(*bolt.DB)
+
+	// Log after singleflight completes, when 'shared' is available
+	// Get the cache entry to log expiration time
+	if entry, ok := f.dbCache.Load(filename); ok {
+		cacheEntry := entry.(*dbCacheEntry)
+		f.logger.Debug("opened database",
+			"filename", filename,
+			"shared", shared,
+			"expires", cacheEntry.expiresAt)
+	}
+
+	return db, nil
 }
 
 // getAllDatabases returns a list of all database filenames in the FSM directory.
@@ -464,6 +474,15 @@ func (r *RaftBackend) SetFSMApplyCallback(f func()) {
 }
 
 func (f *FSM) openDBFile(filename string) (*bolt.DB, error) {
+	// If there's a test hook, use it to wrap the actual open function
+	if f.openDBFileHook != nil {
+		return f.openDBFileHook(filename, f.openDBFileInternal)
+	}
+	return f.openDBFileInternal(filename)
+}
+
+// openDBFileInternal contains the actual database opening logic
+func (f *FSM) openDBFileInternal(filename string) (*bolt.DB, error) {
 	if len(filename) == 0 {
 		return nil, errors.New("can not open empty filename")
 	}
@@ -1098,412 +1117,20 @@ func (f *FSM) applyBatchTxOps(tx *bolt.Tx, b *bolt.Bucket, txnState *fsmTxnCommi
 	return writtenKeys, nil
 }
 
-/*
-// ApplyBatchOld will apply a set of logs to the FSM. This is called from the raft
-// library.
-func (f *FSM) ApplyBatchOld(logs []*raft.Log) []interface{} {
-	numLogs := len(logs)
-
-	if numLogs == 0 {
-		return []interface{}{}
-	}
-
-	// We will construct one slice per log, each slice containing another slice of results from our get ops
-	entrySlices := make([][]*FSMEntry, 0, numLogs)
-
-	// Do the unmarshalling first so we don't hold locks
-	var latestConfiguration *ConfigurationValue
-	commands := make([]interface{}, 0, numLogs)
-	for _, l := range logs {
-		switch l.Type {
-		case raft.LogCommand:
-			command := &LogData{}
-			err := proto.Unmarshal(l.Data, command)
-			if err != nil {
-				f.logger.Error("error proto unmarshaling log data", "error", err)
-				panic("error proto unmarshaling log data")
-			}
-			commands = append(commands, command)
-		case raft.LogConfiguration:
-			configuration := raft.DecodeConfiguration(l.Data)
-			config := raftConfigurationToProtoConfiguration(l.Index, configuration)
-
-			commands = append(commands, config)
-
-			// Update the latest configuration the fsm has received; we will
-			// store this after it has been committed to storage.
-			latestConfiguration = config
-
-		default:
-			panic(fmt.Sprintf("got unexpected log type: %d", l.Type))
-		}
-	}
-
-	// Only advance latest pointer if this log has a higher index value than
-	// what we have seen in the past.
-	var logIndex []byte
-	var err error
-	latestIndex, _ := f.LatestState()
-	lastLog := logs[numLogs-1]
-	if latestIndex.Index < lastLog.Index {
-		logIndex, err = proto.Marshal(&IndexValue{
-			Term:  lastLog.Term,
-			Index: lastLog.Index,
-		})
-		if err != nil {
-			f.logger.Error("unable to marshal latest index", "error", err)
-			panic("unable to marshal latest index")
-		}
-	}
-
-	f.l.RLock()
-	defer f.l.RUnlock()
-
-	if f.applyCallback != nil {
-		f.applyCallback()
-	}
-
-	var lowestActiveIndex *uint64
-
-	// One would think that this f.db.Update(...) and the following loop over
-	// commands should be in the opposite order, as we want transactions to be
-	// applied atomically. Indeed, 2c154ad516162dcb8b15ad270cd6a15516f2ce59 had
-	// this ordered that way. It has two issues though:
-	//
-	// 1. It is slower, as each bbolt transaction incurs additional storage
-	//    writes.
-	// 2. Technically, Raft expects the entire batch to succeed or fail as a
-	//    unit; thus, we don't want to commit partial state from a previous
-	//    log entry (that succeeded) when a later log entry fails.
-	//
-	// Hence, keep the original upstream ordering of Update w.r.t. batch
-	// application and switch to pre-verifying transactions prior tok,
-	// performing any writes in them.
-	dbDefault, err := f.getDB(databaseFilename())
-	if err != nil {
-		f.logger.Error("failed to get default database", "error", err)
-		panic("failed to get default database")
-	}
-	err = dbDefault.Update(func(tx *bolt.Tx) error {
-		configB := tx.Bucket(configBucketName)
-		latestIndex := atomic.LoadUint64(f.latestIndex)
-
-		for commandIndex, commandRaw := range commands {
-			entrySlice := make([]*FSMEntry, 0, 1)
-
-			switch command := commandRaw.(type) {
-			case *LogData:
-				txnState := f.fastTxnTracker.applyState(latestIndex, commandIndex, logs[commandIndex].Index)
-				b := tx.Bucket(dataBucketName)
-				if len(command.Operations) == 0 || command.Operations[0].OpType != beginTxOp {
-					_, err = f.applyBatchNonTxOps(b, txnState, command)
-				} else {
-					_, err = f.applyBatchTxOps(tx, b, txnState, command)
-				}
-
-				if command.LowestActiveIndex != nil {
-					lowestActiveIndex = command.LowestActiveIndex
-				}
-
-				if err != nil {
-					// If we're in a transaction, we do not want to err the
-					// global f.db.Update call unless this is a critical error
-					// worthy of a panic(...).
-					//
-					// Create a special FSMEntry to send back the error
-					// message, that applyLog(...) will look for if it
-					// sent a transaction.
-					if txnState.getInTx() && errors.Is(err, physical.ErrTransactionCommitFailure) {
-						entrySlice = append(entrySlice, &FSMEntry{
-							Key:   fsmEntryTxErrorKey,
-							Value: []byte(err.Error()),
-						})
-
-						// Process other events; this transaction failure was handled
-						// appropriately already in applyBatchTxOps.
-						err = nil
-					}
-				}
-			case *ConfigurationValue:
-				configBytes, err := proto.Marshal(command)
-				if err != nil {
-					return err
-				}
-				if err := configB.Put(latestConfigKey, configBytes); err != nil {
-					return err
-				}
-			}
-
-			entrySlices = append(entrySlices, entrySlice)
-
-			if err != nil {
-				break
-			}
-		}
-
-		return err
-	})
-
-	// If we had no error, update our last applied log.
-	if err == nil {
-		err = dbDefault.Update(func(tx *bolt.Tx) error {
-			if len(logIndex) > 0 {
-				b := tx.Bucket(configBucketName)
-				err = b.Put(latestIndexKey, logIndex)
-				if err != nil {
-					return err
-				}
-			}
-
-			return nil
-		})
-	}
-
-	if err != nil {
-		f.logger.Error("failed to store data", "error", err)
-		panic("failed to store data")
-	}
-
-	if lowestActiveIndex != nil {
-		f.fastTxnTracker.clearOldEntries(*lowestActiveIndex)
-	}
-
-	// If we advanced the latest value, update the in-memory representation too.
-	if len(logIndex) > 0 {
-		atomic.StoreUint64(f.latestTerm, lastLog.Term)
-		atomic.StoreUint64(f.latestIndex, lastLog.Index)
-	}
-
-	// If one or more configuration changes were processed, store the latest one.
-	if latestConfiguration != nil {
-		f.latestConfig.Store(latestConfiguration)
-	}
-
-	// Build the responses. The logs array is used here to ensure we reply to
-	// all command values; even if they are not of the types we expect. This
-	// should futureproof this function from more log types being provided.
-	resp := make([]interface{}, numLogs)
-	for i := range logs {
-		resp[i] = &FSMApplyResponse{
-			Success:    true,
-			EntrySlice: entrySlices[i],
-		}
-	}
-
-	return resp
-}
-
-// this is copied from the latest branch 0dcb577 before "Improve raft transaction application performance (#634)"
-// ApplyBatchTry will apply a set of logs to the FSM. This is called from the raft
-// library.
-func (f *FSM) ApplyBatchTry(logs []*raft.Log) []interface{} {
-	numLogs := len(logs)
-
-	if numLogs == 0 {
-		return []interface{}{}
-	}
-
-	dbList := make([]*bolt.DB, numLogs)
-	dbName := make([]string, numLogs)
-
-	// We will construct one slice per log, each slice containing another slice of results from our get ops
-	entrySlices := make([][]*FSMEntry, 0, numLogs)
-
-	// Do the unmarshalling first so we don't hold locks
-	var latestConfiguration *ConfigurationValue
-	commands := make([]interface{}, 0, numLogs)
-	for i, l := range logs {
-		vaultDBName := databaseFilename()
-		switch l.Type {
-		case raft.LogCommand:
-			command := &LogData{}
-			err := proto.Unmarshal(l.Data, command)
-			if err != nil {
-				f.logger.Error("error proto unmarshaling log data", "error", err)
-				panic("error proto unmarshaling log data")
-			}
-			commands[i] = command
-			if command.BucketName != nil {
-				vaultDBName = *command.BucketName
-			}
-		case raft.LogConfiguration:
-			configuration := raft.DecodeConfiguration(l.Data)
-			config := raftConfigurationToProtoConfiguration(l.Index, configuration)
-
-			commands[i] = config
-
-			// Update the latest configuration the fsm has received; we will
-			// store this after it has been committed to storage.
-			latestConfiguration = config
-		default:
-			panic(fmt.Sprintf("got unexpected log type: %d", l.Type))
-		}
-		db, err := f.getDB(vaultDBName)
-		if err != nil {
-			f.logger.Error("unable to get db", "error", err, "bucket", vaultDBName)
-			panic("unable to get db")
-		}
-		dbName[i] = vaultDBName
-		dbList[i] = db
-	}
-	// Only advance latest pointer if this log has a higher index value than
-	// what we have seen in the past.
-	var logIndex []byte
-	var err error
-	latestIndex, _ := f.LatestState()
-	lastLog := logs[numLogs-1]
-	if latestIndex.Index < lastLog.Index {
-		logIndex, err = proto.Marshal(&IndexValue{
-			Term:  lastLog.Term,
-			Index: lastLog.Index,
-		})
-		if err != nil {
-			f.logger.Error("unable to marshal latest index", "error", err)
-			panic("unable to marshal latest index")
-		}
-	}
-
-	latestIndexAtomic := atomic.LoadUint64(f.latestIndex)
-
-	var lowestActiveIndex *uint64
-
-	f.l.RLock()
-	defer f.l.RUnlock()
-
-	if f.applyCallback != nil {
-		f.applyCallback()
-	}
-
-	// This loop and subsequent f.db.Update call were reordered from upstream,
-	// to enable one transaction per command. Raft chunking will already be
-	// applied, so if logs are split across multiple operations, we'll see
-	// only a single call here. This ensures that our transaction really will
-	// apply at the bolt level, independent of the other operations occurring,
-	// and lets us back out just the changes in the transaction if they fail
-	// to apply.
-	for commandIndex, commandRaw := range commands {
-		inTx := false
-		entrySlice := make([]*FSMEntry, 0)
-		err = dbList[commandIndex].Update(func(tx *bolt.Tx) error {
-			switch command := commandRaw.(type) {
-			case *LogData:
-				b := tx.Bucket(dataBucketName)
-				txnState := f.fastTxnTracker.applyState(latestIndexAtomic, commandIndex, logs[commandIndex].Index)
-				if len(command.Operations) == 0 || command.Operations[0].OpType != beginTxOp {
-					_, err = f.applyBatchNonTxOps(b, txnState, command)
-				} else {
-					_, err = f.applyBatchTxOps(tx, b, txnState, command)
-				}
-
-				if command.LowestActiveIndex != nil {
-					lowestActiveIndex = command.LowestActiveIndex
-				}
-
-				if err != nil {
-					// If we're in a transaction, we do not want to err the
-					// global f.db.Update call unless this is a critical error
-					// worthy of a panic(...).
-					//
-					// Create a special FSMEntry to send back the error
-					// message, that applyLog(...) will look for if it
-					// sent a transaction.
-					if txnState.getInTx() && errors.Is(err, physical.ErrTransactionCommitFailure) {
-						entrySlice = append(entrySlice, &FSMEntry{
-							Key:   fsmEntryTxErrorKey,
-							Value: []byte(err.Error()),
-						})
-
-						// Process other events; this transaction failure was handled
-						// appropriately already in applyBatchTxOps.
-						err = nil
-					}
-				}
-			case *ConfigurationValue:
-				b := tx.Bucket(configBucketName)
-				configBytes, err := proto.Marshal(command)
-				if err != nil {
-					return err
-				}
-				if err := b.Put(latestConfigKey, configBytes); err != nil {
-					return err
-				}
-			}
-
-			return nil
-		})
-
-		entrySlices[commandIndex] = entrySlice
-
-		if err != nil && inTx && errors.Is(err, physical.ErrTransactionCommitFailure) {
-			// Process other events; this transaction failure was handled
-			// appropriately.
-			err = nil
-			continue
-		}
-
-		if err != nil {
-			// Unknown error type or non-transactional error; exit and panic.
-			break
-		}
-	}
-
-	if err == nil {
-		var db *bolt.DB
-		db, err = f.getDB(databaseFilename())
-		if err == nil {
-			err = db.Update(func(tx *bolt.Tx) error {
-				if len(logIndex) > 0 {
-					b := tx.Bucket(configBucketName)
-					err = b.Put(latestIndexKey, logIndex)
-					if err != nil {
-						return err
-					}
-				}
-
-				return nil
-			})
-		}
-	}
-
-	if err != nil {
-		f.logger.Error("failed to store data", "error", err)
-		panic("failed to store data")
-	}
-
-	if lowestActiveIndex != nil {
-		f.fastTxnTracker.clearOldEntries(*lowestActiveIndex)
-	}
-
-	// If we advanced the latest value, update the in-memory representation too.
-	if len(logIndex) > 0 {
-		atomic.StoreUint64(f.latestTerm, lastLog.Term)
-		atomic.StoreUint64(f.latestIndex, lastLog.Index)
-	}
-
-	// If one or more configuration changes were processed, store the latest one.
-	if latestConfiguration != nil {
-		f.latestConfig.Store(latestConfiguration)
-	}
-
-	// Build the responses. The logs array is used here to ensure we reply to
-	// all command values; even if they are not of the types we expect. This
-	// should futureproof this function from more log types being provided.
-	resp := make([]interface{}, numLogs)
-	for i := range logs {
-		resp[i] = &FSMApplyResponse{
-			Success:    true,
-			EntrySlice: entrySlices[i],
-		}
-	}
-
-	return resp
-}
-*/
-
-// ApplyBatch combines multi-database support from ApplyBatchTry with the single
-// transaction pattern from ApplyBatchOld. It groups commands by database and
+// ApplyBatch groups commands by database and
 // executes one transaction per unique database, rather than one transaction per
 // command or one transaction for all commands.
+//
+// PANIC SAFETY: This function is called by the Raft library to apply committed
+// log entries to the FSM. Panicking is the CORRECT behavior when we fail to
+// apply a committed log entry because:
+//  1. The log entry has already been committed by the Raft cluster
+//  2. Failing to apply it means our FSM state diverges from other nodes
+//  3. A divergent FSM state is unrecoverable corruption
+//  4. The node must halt to prevent serving incorrect data
+//  5. Raft semantics explicitly allow (and expect) FSMs to crash on errors
+//
+// Recovery requires operator intervention: restore from snapshot or rebuild the node.
 func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	numLogs := len(logs)
 
@@ -1528,6 +1155,11 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			err := proto.Unmarshal(l.Data, command)
 			if err != nil {
 				f.logger.Error("error proto unmarshaling log data", "error", err)
+				// PANIC: Cannot unmarshal committed log entry. This indicates either:
+				// - Corrupted Raft log storage
+				// - Incompatible protocol buffer schema change
+				// - Memory corruption
+				// All of these are unrecoverable errors requiring node restart.
 				panic("error proto unmarshaling log data")
 			}
 			commands = append(commands, command)
@@ -1544,11 +1176,22 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			// store this after it has been committed to storage.
 			latestConfiguration = config
 		default:
+			// PANIC: Unknown Raft log type. This indicates:
+			// - Incompatible Raft library version
+			// - Corrupted log entry
+			// - Bug in Raft library
+			// Cannot safely process unknown log types.
 			panic(fmt.Sprintf("got unexpected log type: %d", l.Type))
 		}
 		db, err := f.getDB(vaultDBName)
 		if err != nil {
 			f.logger.Error("unable to get db", "error", err, "bucket", vaultDBName)
+			// PANIC: Cannot open database file for committed log entry. This indicates:
+			// - Disk I/O failure
+			// - File permission issues
+			// - Corrupted database file
+			// - Out of disk space
+			// Cannot apply log without database access.
 			panic("unable to get db")
 		}
 		dbName[i] = vaultDBName
@@ -1568,6 +1211,11 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		})
 		if err != nil {
 			f.logger.Error("unable to marshal latest index", "error", err)
+			// PANIC: Cannot marshal index metadata. This indicates:
+			// - Memory corruption
+			// - Protobuf library bug
+			// - Invalid index values (should never happen)
+			// This is a critical metadata operation that must succeed.
 			panic("unable to marshal latest index")
 		}
 	}
@@ -1702,6 +1350,12 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		dbDefault, getErr := f.getDB(databaseFilename())
 		if getErr != nil {
 			f.logger.Error("failed to get default database", "error", getErr)
+			// PANIC: Cannot access default database to update latest index.
+			// This is required metadata that tracks FSM state. Failure indicates:
+			// - Default database file is corrupted or inaccessible
+			// - Disk I/O failure
+			// - File system errors
+			// Cannot maintain consistent state without this metadata.
 			panic("failed to get default database")
 		}
 		err = dbDefault.Update(func(tx *bolt.Tx) error {
@@ -1719,6 +1373,14 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 
 	if err != nil {
 		f.logger.Error("failed to store data", "error", err)
+		// PANIC: Failed to persist committed log entries to disk. This is the
+		// most critical failure in the FSM - we have a committed log entry that
+		// we cannot apply. Failure indicates:
+		// - Disk write failure
+		// - Transaction commit failure
+		// - Database corruption
+		// - Out of disk space
+		// Continuing would cause state divergence from the cluster.
 		panic("failed to store data")
 	}
 
@@ -1860,8 +1522,15 @@ func (f *FSM) writeTo(ctx context.Context, metaSink writeErrorCloser, sink write
 		}
 	}
 
-	metaSink.Close()
-	sink.CloseWithError(nil)
+	// Close metadata sink - log any errors but snapshot is complete
+	if err := metaSink.Close(); err != nil {
+		f.logger.Warn("failed to close metadata sink after successful snapshot", "error", err)
+	}
+
+	// Close data sink with nil error to indicate success
+	if err := sink.CloseWithError(nil); err != nil {
+		f.logger.Warn("failed to close snapshot sink after successful write", "error", err)
+	}
 }
 
 // Snapshot implements the FSM interface. It returns a noop snapshot object.
@@ -1924,9 +1593,9 @@ func (f *FSM) Restore(r io.ReadCloser) error {
 	}
 
 	for _, dbName := range currentDBs {
-		db, ok := f.dbCache.Get(dbName)
-		if ok && db != nil {
-			if closeErr := db.Close(); closeErr != nil {
+		if entry, ok := f.dbCache.Load(dbName); ok {
+			cacheEntry := entry.(*dbCacheEntry)
+			if closeErr := cacheEntry.db.Close(); closeErr != nil {
 				f.logger.Error("failed to close database", "database", dbName, "error", closeErr)
 				closeErrors = append(closeErrors, closeErr)
 			} else {
@@ -1936,7 +1605,10 @@ func (f *FSM) Restore(r io.ReadCloser) error {
 	}
 
 	// Clear the database cache
-	f.dbCache.DeleteAll()
+	f.dbCache.Range(func(key, value interface{}) bool {
+		f.dbCache.Delete(key)
+		return true
+	})
 
 	f.logger.Info("installing snapshot to FSM")
 

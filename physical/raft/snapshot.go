@@ -31,6 +31,10 @@ const (
 	boltSnapshotID = "bolt-snapshot"
 	tmpSuffix      = ".tmp"
 	snapPath       = "snapshots"
+
+	// File permissions for snapshots
+	snapshotDirPermissions  = 0o700
+	snapshotFilePermissions = 0o600
 )
 
 // BoltSnapshotStore implements the SnapshotStore interface and allows snapshots
@@ -87,7 +91,7 @@ func NewBoltSnapshotStore(base string, logger log.Logger, fsm *FSM) (*BoltSnapsh
 
 	// Ensure our path exists
 	path := filepath.Join(base, snapPath)
-	if err := os.MkdirAll(path, 0o700); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(path, snapshotDirPermissions); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("snapshot path not accessible: %v", err)
 	}
 
@@ -195,13 +199,23 @@ func (f *BoltSnapshotStore) openFromFSM() (*raft.SnapshotMeta, io.ReadCloser, er
 	n, err := io.Copy(io.Discard, metaReadCloser)
 	if err != nil {
 		f.logger.Error("failed to read state file", "error", err)
-		metaReadCloser.Close()
-		readCloser.Close()
+		if closeErr := metaReadCloser.Close(); closeErr != nil {
+			f.logger.Warn("failed to close meta reader during error cleanup", "error", closeErr)
+		}
+		if closeErr := readCloser.Close(); closeErr != nil {
+			f.logger.Warn("failed to close reader during error cleanup", "error", closeErr)
+		}
 		return nil, nil, err
 	}
 
 	meta.Size = n
-	metaReadCloser.Close()
+	if err := metaReadCloser.Close(); err != nil {
+		f.logger.Warn("failed to close meta reader", "error", err)
+		if closeErr := readCloser.Close(); closeErr != nil {
+			f.logger.Warn("failed to close reader during error cleanup", "error", closeErr)
+		}
+		return nil, nil, err
+	}
 
 	return meta, readCloser, nil
 }
@@ -212,7 +226,7 @@ func (f *BoltSnapshotStore) getMetaFromDB(id string) (*raft.SnapshotMeta, error)
 	}
 
 	filename := filepath.Join(f.path, id, databaseFilename())
-	boltDB, err := bolt.Open(filename, 0o600, &bolt.Options{Timeout: 1 * time.Second})
+	boltDB, err := bolt.Open(filename, snapshotFilePermissions, &bolt.Options{Timeout: boltOpenTimeout})
 	if err != nil {
 		return nil, err
 	}
@@ -325,14 +339,14 @@ func (s *BoltSnapshotSink) writeBoltDBFile() error {
 	s.logger.Info("creating new snapshot", "path", path)
 
 	// Make the directory
-	if err := os.MkdirAll(path, 0o700); err != nil {
+	if err := os.MkdirAll(path, snapshotDirPermissions); err != nil {
 		s.logger.Error("failed to make snapshot directory", "error", err)
 		return err
 	}
 
 	// Create the BoltDB file
 	dbPath := filepath.Join(path, databaseFilename())
-	boltDB, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
+	boltDB, err := bolt.Open(dbPath, snapshotFilePermissions, &bolt.Options{Timeout: boltOpenTimeout})
 	if err != nil {
 		return err
 	}
@@ -445,7 +459,7 @@ func (s *BoltSnapshotSink) writeBoltDBFile() error {
 
 					// Open new database
 					newDBPath := filepath.Join(path, newDBName)
-					newDB, err := bolt.Open(newDBPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
+					newDB, err := bolt.Open(newDBPath, snapshotFilePermissions, &bolt.Options{Timeout: boltOpenTimeout})
 					if err != nil {
 						s.logger.Error("snapshot write: failed to open new database", "database", newDBName, "error", err)
 						s.writeError = err
@@ -522,7 +536,13 @@ func (s *BoltSnapshotSink) Close() error {
 	s.closed = true
 
 	if s.writer != nil {
-		s.writer.Close()
+		if err := s.writer.Close(); err != nil {
+			s.logger.Error("failed to close snapshot writer", "error", err)
+			<-s.doneWritingCh
+			// Clean up the incomplete snapshot
+			_ = os.RemoveAll(s.dir)
+			return err
+		}
 		<-s.doneWritingCh
 
 		if s.writeError != nil {
@@ -563,7 +583,9 @@ func (s *BoltSnapshotSink) Cancel() error {
 	s.closed = true
 
 	if s.writer != nil {
-		s.writer.Close()
+		if err := s.writer.Close(); err != nil {
+			s.logger.Warn("failed to close snapshot writer during cancel", "error", err)
+		}
 		<-s.doneWritingCh
 
 		// Attempt to remove all artifacts

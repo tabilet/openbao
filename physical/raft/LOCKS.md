@@ -398,32 +398,27 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 **Cache Invalidation**:
 The current implementation tracks successfully written keys and triggers the `invalidateHook` asynchronously after releasing locks, ensuring cache coherency without blocking the FSM.
 
-### Pattern 4 Variants: ApplyBatch Evolution
+### Pattern 4: ApplyBatch Implementation
 
-The codebase contains three ApplyBatch implementations showing the evolution of the design:
+The current ApplyBatch implementation represents the evolution from earlier designs:
 
-**ApplyBatchOld** (`fsm.go:967-1157`):
-- **Strategy**: Single transaction for all commands in default database only
-- **Lock**: One FSM.l.RLock for entire batch
-- **Use Case**: Single-database mode (`mEnabled = false`)
-- **Pros**: Simplest, fastest for single database
-- **Cons**: No multi-database support
-
-**ApplyBatchTry** (`fsm.go:1162-1363`):
-- **Strategy**: One transaction per command (experimental)
-- **Lock**: One FSM.l.RLock for entire batch
-- **Use Case**: Early multi-database attempt
-- **Pros**: Full multi-database support
-- **Cons**: Too many transactions (N commands = N transactions), slower
-
-**ApplyBatch** (`fsm.go:1369-1621`) - **CURRENT**:
+**ApplyBatch** (`fsm.go:1101+`) - **CURRENT IMPLEMENTATION**:
 - **Strategy**: Groups commands by database, one transaction per unique database
 - **Lock**: One FSM.l.RLock for entire batch
 - **Use Case**: Production multi-database mode
-- **Pros**: Balances transaction overhead with isolation
-- **Cons**: More complex than ApplyBatchOld
+- **Pros**: Balances transaction overhead with isolation, supports both single and multi-database modes
+- **Design Evolution**:
+  - Combines multi-database support with efficient transaction batching
+  - Groups commands by database to minimize transaction overhead
+  - One transaction per unique database (not per command, not one for all)
 
-The current implementation (ApplyBatch) represents the optimal balance between performance and multi-tenant isolation.
+**Historical Context**:
+Previous implementations (ApplyBatchOld and ApplyBatchTry) have been removed from the codebase.
+- ApplyBatchOld used a single transaction for all commands (single-database only)
+- ApplyBatchTry used one transaction per command (too many transactions)
+- Current ApplyBatch combines the best of both: multi-database support with efficient batching
+
+The current implementation represents the optimal balance between performance and multi-tenant isolation.
 
 ---
 

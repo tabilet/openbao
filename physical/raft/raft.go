@@ -90,6 +90,18 @@ var (
 
 	otherDBDefaultExpiry   = time.Minute * 5
 	otherDBCleanupInterval = time.Minute * 10
+
+	// Network transport configuration
+	raftTransportMaxPool    = 3
+	raftTransportTimeout    = 10 * time.Second
+	raftNotifyChannelBuffer = 10
+
+	// Polling and retry intervals
+	electionTickerInterval      = 10 * time.Millisecond
+	waitForLeaderTickerInterval = 50 * time.Millisecond
+
+	// Database timeouts
+	boltOpenTimeout = 1 * time.Second
 )
 
 // RaftBackend implements the backend interfaces and uses the raft protocol to
@@ -992,8 +1004,8 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 		}
 		transConfig := &raft.NetworkTransportConfig{
 			Stream:                streamLayer,
-			MaxPool:               3,
-			Timeout:               10 * time.Second,
+			MaxPool:               raftTransportMaxPool,
+			Timeout:               raftTransportTimeout,
 			ServerAddressProvider: b.serverAddressProvider,
 			Logger:                b.logger.Named("raft-net"),
 		}
@@ -1006,7 +1018,7 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 	raftConfig.LocalID = raft.ServerID(b.localID)
 
 	// Set up a channel for reliable leader notifications.
-	raftNotifyCh := make(chan bool, 10)
+	raftNotifyCh := make(chan bool, raftNotifyChannelBuffer)
 	raftConfig.NotifyCh = raftNotifyCh
 
 	// If we have a bootstrapConfig set we should bootstrap now.
@@ -1070,10 +1082,10 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 	if opts.StartAsLeader {
 		// ticker is used to prevent memory leak of using time.After in
 		// for - select pattern.
-		ticker := time.NewTicker(10 * time.Millisecond)
+		ticker := time.NewTicker(electionTickerInterval)
 		defer ticker.Stop()
 		for raftObj.State() != raft.Leader {
-			ticker.Reset(10 * time.Millisecond)
+			ticker.Reset(electionTickerInterval)
 			select {
 			case <-ctx.Done():
 				future := raftObj.Shutdown()
@@ -1136,7 +1148,7 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 			reloadConfig()
 		} else {
 			go func() {
-				ticker := time.NewTicker(50 * time.Millisecond)
+				ticker := time.NewTicker(waitForLeaderTickerInterval)
 				// Emulate the random timeout used in Raft lib, to ensure that
 				// if all nodes are brought up simultaneously, they don't all
 				// call for an election at once.
@@ -1969,20 +1981,6 @@ func (b *RaftBackend) DeleteMountView(ctx context.Context, path, uuid string) er
 
 	_, err := b.fsm.getDB(databaseFilename(uuid))
 	if err == nil {
-		/* // Old code to delete all buckets in the DB before closing and deleting
-		err = db.Update(func(tx *bolt.Tx) error {
-			if tx.Bucket(dataBucketName) != nil {
-				if e := tx.DeleteBucket(dataBucketName); e != nil {
-					return e
-				}
-			}
-			if tx.Bucket(configBucketName) != nil {
-				return tx.DeleteBucket(configBucketName)
-			}
-			return nil
-		})
-		*/
-
 		err = b.fsm.closeDBFile(uuid)
 	}
 
@@ -2105,17 +2103,33 @@ func (l *RaftLock) Unlock() error {
 }
 
 // Value reads the value of the lock. This informs us who is currently leader.
+//
+// Returns (held, value, error) where:
+//   - held: true if the lock key exists in storage (indicates a leader exists/existed)
+//   - value: the identity of the leader who wrote the key
+//   - error: any error encountered reading the key
+//
+// In Raft, leadership is tied to being the Raft leader. Each leader writes their
+// identity to the lock key upon acquiring leadership. The key is updated by
+// successive leaders but never deleted. Therefore:
+//   - If the key exists, it indicates the cluster has a leader (current or very recent)
+//   - The value represents the most recent leader's identity
+//   - In a healthy cluster, this is effectively the current leader
+//
+// This implementation correctly follows the physical.Lock interface semantics:
+// "Returns the value of the lock and if it is held by _any_ node"
 func (l *RaftLock) Value() (bool, string, error) {
 	e, err := l.b.Get(context.Background(), l.key)
 	if err != nil {
 		return false, "", err
 	}
 	if e == nil {
+		// No lock key exists - no leader has ever acquired the lock
 		return false, "", nil
 	}
 
+	// Lock key exists - a leader has acquired the lock (current or recent)
 	value := string(e.Value)
-	// TODO: how to tell if held?
 	return true, value, nil
 }
 
@@ -2157,7 +2171,7 @@ func (s sealer) Open(ctx context.Context, ct []byte) ([]byte, error) {
 // bolt.Open(), pre-configured with all of our preferred defaults.
 func boltOptions(path string) *bolt.Options {
 	o := &bolt.Options{
-		Timeout:        1 * time.Second,
+		Timeout:        boltOpenTimeout,
 		FreelistType:   bolt.FreelistMapType,
 		NoFreelistSync: true,
 		MmapFlags:      getMmapFlags(path),
