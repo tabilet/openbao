@@ -126,8 +126,6 @@ func getDatabaseName(ctx context.Context) (string, error) {
 
 ### Get Operation
 
-**Location:** `fsm.go:434-458`
-
 ```go
 func (f *FSM) Get(ctx context.Context, path string) (*physical.Entry, error) {
     return f.withDBView(ctx, func(db *bolt.DB) (*physical.Entry, error) {
@@ -146,8 +144,6 @@ func (f *FSM) Get(ctx context.Context, path string) (*physical.Entry, error) {
 4. Executes read transaction on namespace-specific database
 
 ### Put Operation
-
-**Location:** `fsm.go:460-477`
 
 ```go
 func (f *FSM) Put(ctx context.Context, entry *physical.Entry) error {
@@ -170,8 +166,6 @@ func (f *FSM) Put(ctx context.Context, entry *physical.Entry) error {
 
 ### Delete Operation
 
-**Location:** `fsm.go:479-493`
-
 ```go
 func (f *FSM) Delete(ctx context.Context, path string) error {
     return f.withDBUpdate(ctx, func(db *bolt.DB) error {
@@ -183,8 +177,6 @@ func (f *FSM) Delete(ctx context.Context, path string) error {
 ```
 
 ### List Operation
-
-**Location:** `fsm.go:495-538`
 
 ```go
 func (f *FSM) List(ctx context.Context, prefix string) ([]string, error) {
@@ -198,8 +190,6 @@ func (f *FSM) List(ctx context.Context, prefix string) ([]string, error) {
 ```
 
 ### Helper Functions
-
-**Location:** `fsm.go:217-251`
 
 ```go
 // getDatabaseForContext retrieves the database for the given context
@@ -240,8 +230,6 @@ func (f *FSM) withDBUpdate(ctx context.Context, fn func(*bolt.DB) error) error {
 ## Batch Operations
 
 ### ApplyBatch - Optimized Multi-Database Batching
-
-**Location:** `fsm.go:1274-1515`
 
 The `ApplyBatch` function has been improved to efficiently handle multi-database operations by grouping commands by their target database and executing one transaction per database.
 
@@ -344,8 +332,6 @@ Result: 3 transactions instead of 1000
 
 ### Snapshot Creation
 
-**Location:** `fsm.go:1559-1692`
-
 #### Overview
 
 Snapshots now include **all databases** from all namespaces, not just the default database.
@@ -423,8 +409,6 @@ func (f *FSM) writeTo(ctx context.Context, metaSink, sink writeErrorCloser) {
 
 ### Snapshot Reception (Sink)
 
-**Location:** `snapshot.go:362-486`
-
 #### Implementation
 
 The snapshot sink has been enhanced to handle database markers and automatically switch between database files during snapshot restoration:
@@ -500,8 +484,6 @@ go func() {
 ```
 
 ### Snapshot Restore
-
-**Location:** `fsm.go:1716-1836`
 
 #### Overview
 
@@ -584,8 +566,6 @@ func (f *FSM) Restore(r io.ReadCloser) error {
 
 #### getAllDatabases()
 
-**Location:** `fsm.go:286-288`
-
 ```go
 func (f *FSM) getAllDatabases() ([]string, error) {
     return f.findDatabasesInDir(f.path)
@@ -595,8 +575,6 @@ func (f *FSM) getAllDatabases() ([]string, error) {
 Returns all database filenames in the FSM directory.
 
 #### findDatabasesInDir()
-
-**Location:** `fsm.go:293-334`
 
 ```go
 func (f *FSM) findDatabasesInDir(dir string) ([]string, error) {

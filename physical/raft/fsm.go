@@ -567,6 +567,9 @@ func (f *FSM) closeDBFile(filename string) error {
 
 	// Remove database file from disk
 	dbPath := filepath.Join(f.path, filename)
+	//	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	//		return nil
+	//	}
 	return os.Remove(dbPath)
 }
 

@@ -1979,9 +1979,10 @@ func (b *RaftBackend) DeleteMountView(ctx context.Context, path, uuid string) er
 		return nil
 	}
 
-	_, err := b.fsm.getDB(databaseFilename(uuid))
+	filename := databaseFilename(uuid)
+	_, err := b.fsm.getDB(filename)
 	if err == nil {
-		err = b.fsm.closeDBFile(uuid)
+		err = b.fsm.closeDBFile(filename)
 	}
 
 	return err

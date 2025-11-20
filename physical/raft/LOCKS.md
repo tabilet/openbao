@@ -185,8 +185,6 @@ T4: Goroutine B: Gets result without duplicate open ✓
 
 ### Pattern 2: Helper Function Abstraction (Multi-Database)
 
-**Location**: `fsm.go:215-258`
-
 **Purpose**: Encapsulate database selection, access, and locking in reusable helpers that support multi-database mode.
 
 ```go
@@ -277,15 +275,25 @@ func (b *RaftBackend) newTransaction(ctx context.Context, writable bool) (*RaftT
 
 // Lock released here (potentially minutes later!)
 func (t *RaftTransaction) Commit(ctx context.Context) error {
-    defer t.b.fsm.l.RUnlock()       // ← Released here!
-    defer t.b.txnPermitPool.Release()
+    // ...
+    defer func() {
+        // ...
+        t.b.fsm.l.RUnlock()       // ← Released here!
+        t.b.txnPermitPool.Release()
+        // ...
+    }
 
     // ... commit logic ...
 }
 
 func (t *RaftTransaction) Rollback() error {
-    defer t.b.fsm.l.RUnlock()       // ← Or here!
-    defer t.b.txnPermitPool.Release()
+    // ...
+    defer func() {
+        // ...
+        t.b.fsm.l.RUnlock()       // ← Released here!
+        t.b.txnPermitPool.Release()
+        // ...
+    }
 
     // ... rollback logic ...
 }
@@ -303,8 +311,6 @@ func (t *RaftTransaction) Rollback() error {
 **Best Practice**: Applications should keep transactions short (<1 second).
 
 ### Pattern 4: Batch Processing (Multi-Database Grouped)
-
-**Location**: `fsm.go:1369-1621` (Current ApplyBatch)
 
 **Purpose**: Process multiple Raft log entries efficiently across multiple namespace databases.
 

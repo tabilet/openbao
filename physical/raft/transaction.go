@@ -621,9 +621,6 @@ func (t *RaftTransaction) ListPage(ctx context.Context, prefix string, after str
 }
 
 func (t *RaftTransaction) Commit(ctx context.Context) error {
-	defer t.b.fsm.l.RUnlock() // line 209  b.fsm.l.RLock() NEVER UNLOCKED ← Released here!
-	defer t.b.txnPermitPool.Release()
-
 	t.l.Lock()
 	defer t.l.Unlock()
 
@@ -646,7 +643,7 @@ func (t *RaftTransaction) Commit(ctx context.Context) error {
 			// This ensures the cleanup also happens on standby nodes
 		}
 
-		t.b.fsm.l.RUnlock()
+		t.b.fsm.l.RUnlock() // line 209  b.fsm.l.RLock() NEVER UNLOCKED ← Released here!
 		t.b.txnPermitPool.Release()
 		t.haveFinishedTx = true
 
