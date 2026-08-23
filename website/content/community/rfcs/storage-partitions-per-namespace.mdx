@@ -1,0 +1,448 @@
+---
+sidebar_label: Storage partitions per namespace
+description: |-
+  An OpenBao RFC for per-namespace storage partitions, giving each namespace its
+  own PostgreSQL table or BoltDB file so that tenants are isolated at the
+  physical storage layer.
+---
+
+# Storage Partitions per Namespace
+
+## Summary
+
+Give each namespace its own physical storage partition — a separate table in
+PostgreSQL, a separate database file in Raft/BoltDB — rather than sharing a
+single one. This realizes the [Per-Namespace Storage
+Segments](https://github.com/openbao/openbao/issues/787) future work item from
+the namespace RFC, and is gated behind a new `partition_enabled` storage
+parameter defaulting to `false`. A backend that does not implement the new
+interface continues to use one root partition, so this is opt-in twice over: by
+operator configuration and by backend support.
+
+## Problem Statement
+
+Namespaces today give us logical separation of ACL policies, mounts, and
+identities, but every namespace's data still lands in the same table or the same
+BoltDB file. The namespace RFC anticipated this, noting that per-namespace
+storage segments would let each tenant "have its own data storage location and
+so could impact other tenants less"; we now wish to build that.
+
+Sharing one partition costs us in four ways. Every namespace shares one set of
+indexes, so a large tenant slows queries for a small one and neither `VACUUM`
+nor an index rebuild can be scoped to the tenant that needs it. BoltDB takes a
+write lock over the whole file, so applying a write for one namespace blocks
+readers of every other namespace, which is the opposite of the isolation
+namespaces are meant to provide. Operators offering OpenBao as a service cannot
+place a customer on storage of their own. And a corrupt file or a failing disk
+takes down every tenant at once rather than one, leaving no disaster recovery
+boundary between them.
+
+Partitioning also makes per-tenant quotas and data residency achievable, but
+neither is delivered here; both are described under Future Work.
+
+## User-facing description
+
+Operators enable partitioning per storage backend. It defaults to `false`,
+meaning a single root partition for all namespaces, which is the behavior we
+have today:
+
+```hcl
+postgresql {
+  connection_url    = "postgresql://user:pass@pg-server:5432/openbao"
+  table             = "vault_kv_store"
+  partition_enabled = "true"
+}
+```
+
+```hcl
+raft {
+  path              = "/opt/openbao/data"
+  node_id           = "node1"
+  partition_enabled = "true"
+}
+```
+
+Beyond that line of configuration, users and operators should see no difference:
+the API is unchanged, and a namespace behaves exactly as it does now. The one
+exception is that `partition_enabled` is not a runtime toggle, since it changes
+the layout of data on disk rather than the behavior of the server; see
+[Enablement and migration](#enablement-and-migration).
+
+## Technical Description
+
+### The partition interface
+
+A physical backend declares that it can partition by implementing a new
+interface in `sdk/physical`:
+
+```go
+type Partitionable interface {
+  CreatePartition(ctx context.Context, prefix, uuid string) error
+  DeletePartition(ctx context.Context, prefix, uuid string) error
+}
+```
+
+Here `ctx` is the namespace-derived context of the parent of the namespace being
+created, `prefix` is a pre-defined string identifier, and `uuid` is the UUID of
+the child namespace — the same UUID the `NamespaceStore` already uses to prefix
+storage.
+
+The interface belongs in `sdk/physical` rather than beside the backends,
+because `sdk` is a separate Go module and the concrete backends now live under
+[`internal/physical/`](https://github.com/openbao/openbao/tree/main/internal/physical),
+which cannot be imported from outside. Placing it in the SDK keeps it
+implementable by out-of-tree backends.
+
+Detection is a type assertion returning a boolean, and every call site is
+guarded by it, so a backend that does not implement `Partitionable` simply
+continues to use the root partition. This lets us land PostgreSQL and
+Raft/BoltDB support without touching any other backend.
+
+It also means the two backends can land in **separate changes**, in either
+order, with neither depending on the other: the assertion covers a backend that
+has not implemented the interface yet, and `partition_enabled` is configured per
+backend, so the flag simply does not exist for one that has not shipped support.
+Only the layout guard described under
+[Enablement and migration](#enablement-and-migration) needs both, since it must
+recognise an existing layout in whichever backend is in use. This is not a
+change that has to arrive as a single drop.
+
+How to partition is left to the storage engine, but both backends name a
+partition the same way: the base name, `_v_`, and the MD5 of the namespace UUID.
+PostgreSQL creates a table `openbao_kv_store_v_<md5>`; Raft/BoltDB creates a
+file `vault_v_<md5>.db`.
+
+The hash is not for collision resistance, which the UUID already provides. It
+earns its place because one transformation solves a different problem in each
+backend. In PostgreSQL it keeps the identifier within the 63-character limit by
+construction — 16 characters of base name, 3 of separator and 32 of hex digest
+is 51, whatever the namespace path — so the limit is satisfied rather than
+guarded against. In BoltDB it yields a fixed-length filename with no path
+separators. In both, the stored name does not disclose which namespace it
+belongs to.
+
+### Namespace lifecycle
+
+The `NamespaceStore` calls `CreatePartition` when a namespace is created and
+`DeletePartition` when one is
+[deleted](https://github.com/openbao/openbao/blob/main/internal/vault/namespace_store.go#L1259),
+both guarded by the assertion above.
+
+### Routing
+
+Storage operations are routed to the partition for the namespace in context.
+This deserves stating plainly because it is where the risk in this design sits:
+[`physical.Backend`](https://github.com/openbao/openbao/blob/main/sdk/physical/physical.go#L40)
+takes `(ctx, key)` and has no namespace argument, so routing depends entirely on
+the correct namespace travelling in the context to every storage call.
+
+The resolution rule is:
+
+| Context | Database |
+|---|---|
+| No namespace (`ErrNoNamespace`) | the default database |
+| Empty namespace path | the default database |
+| Root namespace UUID | the default database |
+| Any other namespace | that namespace's partition |
+
+Resolving an absent namespace to the default database is deliberate, not a
+fallback we tolerate. Core paths carry no namespace by construction — unseal,
+seal configuration, and the Raft TLS keyring all run before any namespace
+context exists — so treating a missing namespace as an error would prevent the
+node from starting.
+
+The consequence is that correctness rests on the namespace reaching every
+storage call that has one. OpenBao assumes in several places that the HTTP
+context is the root namespace, and those paths must switch to the
+namespace-derived context; the KV secrets engine is one. A path that loses its
+namespace does not fail, it silently reads or writes the root partition, which
+makes this the most important thing to get right in review and in tests.
+
+### Raft/BoltDB
+
+BoltDB is the data storage engine within Raft. `GET` and `LIST` run directly
+against the database file for the namespace in context. `UPDATE` and `DELETE`
+must survive the Raft log, so the target filename is carried in the log and
+recovered in
+[`ApplyBatch`](https://github.com/openbao/openbao/blob/main/internal/physical/raft/fsm.go#L760);
+this requires adding a `database_name` field to the `LogData` protobuf
+definition and regenerating with `protoc`.
+
+**File naming.** The default database is `vault.db`. A namespace's database is
+`vault_v_<md5(uuid)>.db` — the MD5 of the namespace UUID, rendered as hex. The
+hash is not for collision resistance, which the UUID already provides; it buys a
+fixed-length name regardless of input, a name containing no path separators or
+other characters the filesystem might treat specially, and a filename from which
+the namespace cannot be read. All databases match `vault*.db`, which is what
+makes enumeration possible.
+
+**Handle cache.** Open database handles are held in a `sync.Map` keyed by
+filename, with a `singleflight.Group` guarding the open so that concurrent first
+touches of one namespace open the file once rather than racing.
+
+**Handles expire.** A namespace database that has not been used for five minutes
+is closed and dropped from the cache; the next access reopens it. The default
+database is marked never-expiring, since it holds `latest_indexes` and core
+state and is on every path. This is what keeps memory proportional to *active*
+namespaces rather than to all of them: a cluster with twenty thousand namespaces
+and fifty in use holds fifty open files. Both the idle expiry and the sweep
+interval are operator-tunable, via `other_db_expiry` and `other_db_cleanup` in
+the `raft {}` stanza.
+
+**Enumeration.** Partitions are discovered by scanning the data directory for
+`vault*.db`, returning the default database first and the rest sorted. The
+filesystem is the index, so no method on `Partitionable` is needed to find a
+partition orphaned by a failed deletion.
+
+### FSM atomicity and crash recovery
+
+The FSM today applies an entire Raft batch inside a single BoltDB transaction
+and then writes `latest_indexes` in a second one. That ordering is deliberate,
+and the [comment explaining
+it](https://github.com/openbao/openbao/blob/main/internal/physical/raft/fsm.go#L824)
+is explicit that Raft expects a batch to succeed or fail as a unit, so partial
+state from an earlier log entry must not be committed when a later entry fails.
+
+BoltDB has no transaction spanning two files, so we cannot preserve that
+property unchanged. `ApplyBatch` instead groups operations by target database
+and opens one transaction per unique partition the batch touches — not one per
+command, and no longer one for the whole batch.
+
+What this keeps is atomicity within a partition: every operation in a batch that
+targets one namespace commits or rolls back together, which is the unit that
+matters for a tenant. It also keeps the write ordering, in that `latest_indexes`
+is written only after every partition transaction has committed. What it gives
+up is atomicity across partitions, so a batch touching two namespaces may commit
+one and fail the other.
+
+In practice the exposure is smaller than that sounds. OpenBao has no
+cross-namespace operations today, and namespace setup does not use transactions,
+so no current code path depends on a batch spanning two namespaces committing
+atomically. Namespace creation and deletion are ordered so that the parent write
+is the commit point. The constraint this introduces is therefore
+forward-looking: a future cross-namespace operation could not rely on Raft for
+atomicity.
+
+Crash recovery is unaffected in the sense that matters. If the process dies
+between two partition commits, or between the last commit and the index write,
+`latest_indexes` still names the last fully-applied batch; Raft replays from
+there, every node replays the same log, and the nodes converge. This depends on
+partition writes being idempotent under replay, which holds for put and delete.
+
+Deadlock between concurrent readers and the applier is avoided by a single
+global lock order, acquired outermost first: the transaction permit pool, then
+the FSM lock, then the BoltDB transaction. Any code path that takes these in a
+different order is a bug.
+
+### Snapshots, restore, and node join
+
+A Raft snapshot in OpenBao serialises the **FSM's data storage**, not the Raft
+log: `FSM.writeTo` streams the contents of the `data` bucket out of bbolt as
+delimited protobuf messages. Partitioning therefore does affect the snapshot,
+because the data it captures now lives across several files rather than one.
+
+A snapshot must be a point-in-time view of every partition at one applied index,
+and a node joining the cluster must receive all of them. Today
+[`databaseFilename`](https://github.com/openbao/openbao/blob/main/internal/physical/raft/fsm.go#L45)
+is a constant and a snapshot is [a copy of that one
+file](https://github.com/openbao/openbao/blob/main/internal/physical/raft/snapshot.go#L321);
+under partitioning it becomes a function of the partition.
+
+The snapshot remains a single stream. Rather than tagging every record with its
+partition, the stream carries in-band **marker entries**: a record whose key
+begins `__DATABASE__:` and whose value names a database. Restore reads entries
+into the current target database until it meets the next marker, then commits,
+switches, and continues. Databases are created as they are encountered.
+
+Two consequences follow and should be stated rather than discovered. The stream
+is **order-dependent** — records must follow their marker, so a reordering
+transformation would corrupt the restore. And `__DATABASE__:` becomes a reserved
+key prefix in the snapshot encoding.
+
+This changes the snapshot format in both directions: a snapshot taken before
+partitioning restores into a single root partition, and a partitioned snapshot
+cannot be read by a binary that predates this change. `bao operator raft
+snapshot save` and `restore` inherit both rules.
+
+### Enablement and migration
+
+`partition_enabled` changes the layout of data on disk, so setting it on a
+cluster that already holds data in a single partition — or clearing it on a
+partitioned one — is a migration rather than a configuration change.
+
+For this initial implementation we propose that OpenBao refuse to start, with a
+clear message, when the flag disagrees with the layout it finds. Silently
+ignoring existing data would present to an operator as data loss, which is a
+worse outcome than a server that declines to come up. Following the precedent of
+[the split mount table design](split-mount-tables.mdx), we would support forward
+migration when it is implemented and not downgrades.
+
+[PR #3660](https://github.com/openbao/openbao/pull/3660), which adds a
+`migrate-seal` endpoint for moving a namespace between normal and sealable, is
+likely the shape that migration should take here too: taint the namespace,
+migrate in a single transaction, untaint. Layout migration should reuse that
+pattern rather than invent a second one.
+
+## Rationale and alternatives
+
+Splitting PostgreSQL by table gives each namespace independent indexes, so index
+scans stay proportional to a tenant's own data rather than the whole cluster's;
+`VACUUM` and `ANALYZE` can be run against one tenant; an index rebuild does not
+block the others; and slow queries become attributable to a namespace, which
+makes a support question tractable in a way it currently is not.
+
+Splitting Raft/BoltDB by file removes apply-time lock contention between
+namespaces, since BoltDB locks per file, and gives each partition its own page
+cache in the OS. It is worth being precise that this does not parallelize
+consensus: every write still passes through the single Raft log, which is
+serialized, so the gain here is at apply time and in fault isolation rather than
+in write throughput.
+
+Within the Raft backend, the batching design was arrived at by elimination. An
+earlier version wrapped the whole batch in one transaction, which is what the
+single-database FSM does today but cannot span files. A second used one
+transaction per command, which preserved isolation but made far more
+transactions than necessary and paid BoltDB's per-commit cost on each. Grouping
+by target database is the third form: one transaction per distinct partition a
+batch touches, which is the fewest transactions that a multi-file FSM permits.
+
+We considered using BoltDB buckets within a single file instead of separate
+files. Buckets would give logical separation with far less change, but they
+retain a single file lock, so all namespaces remain blocked behind one writer,
+there is no I/O parallelization, and the data cannot be distributed across
+devices. The isolation we want is physical, and buckets do not provide it.
+
+The namespace RFC sketched this as "a new database schema in PostgreSQL (with
+each plugin being a new database table) or a new disk directory in Raft/BoltDB."
+We propose tables and files instead of schemas and directories: a table maps
+directly onto the existing single-table backend and needs no per-namespace
+connection setup, and a file is the unit BoltDB locks, which is the property we
+are trying to exploit.
+
+## Downsides
+
+Routing adds one lookup per operation, and each open BoltDB handle carries a
+fixed overhead — on the order of tens of kilobytes, dominated by bbolt's own
+structures rather than by the data, since the file is memory-mapped and resident
+pages track the working set rather than the file size. Because handles expire
+after five minutes idle, this is proportional to concurrently *active*
+namespaces rather than to all of them, and a workload that touches every
+namespace inside the expiry window is the case that holds every handle open.
+Cross-partition transactions become impossible, which as described above is
+confined to namespace creation and deletion and handled by ordering. The Raft
+snapshot format changes, with the compatibility consequences noted above.
+
+This adds a further moving part to storage, which is the layer where mistakes
+are least forgiving; however, it delivers the physical tenant isolation that
+namespaces promise but cannot currently provide, and on the balance is
+worthwhile.
+
+## Security Implications
+
+Security is expected to be at the same level as current OpenBao, with one
+exception: the number of namespaces becomes observable as a count of tables or
+files to anyone with access to the database or the data directory.
+
+For Raft the leak is a count only. Because a partition is named by the MD5 of
+the namespace UUID, the filename reveals neither the namespace path nor its
+UUID. PostgreSQL table names are derived from the namespace and are not
+obscured, so that backend exposes more.
+
+The namespace-context requirement described under Routing is a security property
+as much as a correctness one. A storage call that loses its namespace could
+otherwise reach another tenant's partition, so failing closed when the context
+is absent is deliberate.
+
+## User/Developer Experience
+
+Users and operators should expect the same experience as single-partition
+OpenBao. Developers touching storage paths must ensure the namespace-derived
+context is propagated; the fail-closed rule above is what makes a mistake
+visible immediately rather than as data quietly written to the wrong place.
+
+## Future Work
+
+### Physical quotas
+
+Per-partition size becomes directly computable once each tenant has its own
+table or file — via `pg_total_relation_size` in PostgreSQL, or the database file
+size in Raft/BoltDB — which would let operators set hard quota limits per tenant
+rather than inferring usage. This is the downstream capability the partition
+boundary is most immediately useful for, and there is existing interest in it.
+However, this work is strictly disjoint from partitioning storage and so will be
+done later.
+
+### Hierarchical storage inheritance
+
+Namespaces could explicitly choose between owning a partition and inheriting the
+parent namespace's, which would keep the partition count proportional to tenants
+rather than to namespaces. However, this work is strictly disjoint from
+partitioning storage and so will be done later.
+
+### Pre-defined storage path templates for Raft
+
+Administrators could pre-configure storage paths for namespaces before those
+namespaces exist, including paths on separate physical or private devices. This
+is what a data residency requirement actually needs, since partitions within one
+data directory share a device. However, this work is strictly disjoint from
+partitioning storage and so will be done later.
+
+### Per-namespace choice of storage backend
+
+A "virtual" physical backend, along the lines of the seal manager, would let an
+operator choose *which* storage backend each namespace uses rather than only
+which partition within one backend. Combined with top-level or
+out-of-hierarchy namespaces, that would allow namespaces to be split across
+clusters entirely. This RFC is a prerequisite — it establishes the per-namespace
+partition boundary that such a backend would select over. However, this work is
+strictly disjoint from partitioning storage and so will be done later.
+
+### `ClearView` and `ScanView` at the physical layer
+
+`ScanView` and `ClearView` exist today in
+[`sdk/logical`](https://github.com/openbao/openbao/blob/main/sdk/logical/storage.go#L100)
+but have no equivalent at `sdk/physical`. Mirroring them down a layer would give
+partition migration and orphan cleanup a supported way to walk and empty a
+partition, rather than each backend growing its own. However, this work is
+strictly disjoint from partitioning storage and so will be done later.
+
+### Migration between layouts
+
+In-place migration between the single and partitioned layouts, rather than
+refusing to start on a mismatch. However, this work is strictly disjoint from
+partitioning storage and so will be done later.
+
+## Unresolved Questions
+
+`Partitionable` provides creation and deletion but no enumeration. For Raft this
+is not a gap — partitions are files and the directory scan finds them — but a
+backend whose partitions are not externally enumerable would have no way to
+recover an orphan left by a failed deletion. Whether the interface should
+therefore gain a list method, or whether that is each backend's problem, remains
+open.
+
+Whether a snapshot is taken under a single FSM lock spanning all partitions or
+per-partition at a pinned applied index is not yet settled, and the guarantee we
+make across files should be stated once it is.
+
+Whether the PostgreSQL implementation shares one connection pool across
+partitions or opens one per partition materially changes the memory
+characteristics above, and should be confirmed against the implementation.
+
+The per-handle overhead above is an estimate, not a measurement. It should be
+established against
+[benchmark-openbao](https://github.com/openbao/benchmark-openbao) before anyone
+sizes a deployment on it, together with the resident cost of the namespace and
+mount indexes, which do not expire and are likely to dominate at high namespace
+counts.
+
+## Related Issues
+
+- [RFC - Add Namespace Support to OpenBao](https://github.com/openbao/openbao/issues/787),
+  whose Per-Namespace Storage Segments future work this RFC implements.
+- [Split the mount table using transactional storage](split-mount-tables.mdx).
+
+## Proof of Concept
+
+Peter Bi has authored a proof of concept here:
+https://github.com/tabilet/openbao/tree/recovered
